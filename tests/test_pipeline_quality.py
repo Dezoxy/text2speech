@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pipeline
+from text2speech import pipeline_app as pipeline
 
 
 def test_page_meets_ocr_threshold() -> None:

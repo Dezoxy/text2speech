@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-import make_mp3
+from text2speech import make_mp3_app as make_mp3
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
