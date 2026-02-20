@@ -37,6 +37,14 @@ from text2speech.shared.dependencies import (
 )
 from text2speech.shared.parsing import parse_csv_items as shared_parse_csv_items
 from text2speech.shared.parsing import parse_string_map as shared_parse_string_map
+from text2speech.shared.tts_engine import (
+    CacheLayer,
+    ChunkPlanner,
+    GoogleClientAdapter,
+    RetryController,
+    SsmlShaper,
+    TtsEngine,
+)
 from text2speech.shared.validators import (
     validate_cost_limit,
     validate_pricing_table,
@@ -1425,6 +1433,25 @@ def run_tts(
         max_delay_s=retry_max_delay_s,
         jitter_s=retry_jitter_s,
     )
+    engine = TtsEngine(
+        client_adapter=GoogleClientAdapter(load_google_tts=load_google_tts),
+        planner=ChunkPlanner(
+            clean_text=clean_text,
+            split_paragraphs=split_paragraphs,
+            detect_chapters=detect_chapters,
+            build_chunk_plan=build_chunk_plan,
+            build_chapter_ranges=build_chapter_ranges,
+        ),
+        shaper=SsmlShaper(shape_ssml_text=shape_ssml_text),
+        cache=CacheLayer(
+            plan_chunk_cache=plan_chunk_cache,
+            adjust_preview_for_cache_candidates=adjust_preview_for_cache_candidates,
+            cache_file_for_key=cache_file_for_key,
+            restore_chunk_from_cache=restore_chunk_from_cache,
+            persist_chunk_to_cache=persist_chunk_to_cache,
+        ),
+        retry=RetryController(synthesize_with_retries=synthesize_with_retries),
+    )
 
     effective_aliases: dict[str, str] = {}
     if pronunciation_file is not None:
@@ -1450,12 +1477,11 @@ def run_tts(
     )
 
     raw = input_txt.read_text(errors="ignore")
-    text = clean_text(raw)
-    paragraphs = split_paragraphs(text)
-    chapters = detect_chapters(paragraphs)
-    chunk_plan = build_chunk_plan(paragraphs, max_chars, chapters)
-    chunks = [chunk.text for chunk in chunk_plan]
-    chapter_ranges = build_chapter_ranges(chapters, chunk_plan)
+    planning = engine.planner.plan(raw, max_chars)
+    text = planning["cleaned"]
+    chunk_plan = planning["chunk_plan"]
+    chunks = planning["chunks"]
+    chapter_ranges = planning["chapter_ranges"]
 
     if write_cleaned is not None:
         write_cleaned.parent.mkdir(parents=True, exist_ok=True)
@@ -1493,7 +1519,7 @@ def run_tts(
         chunks=chunks,
         out_dir=out_dir,
     )
-    cache_plan = plan_chunk_cache(
+    cache_plan = engine.cache.plan_chunk_cache(
         chunks=chunks,
         out_dir=out_dir,
         cache_dir=cache_dir,
@@ -1505,7 +1531,7 @@ def run_tts(
         use_ssml=use_ssml,
         ssml_profile_signature=ssml_profile_signature,
     )
-    preview = adjust_preview_for_cache_candidates(preview, cache_plan)
+    preview = engine.cache.adjust_preview_for_cache_candidates(preview, cache_plan)
     render_billing_preview(preview, ui_mode=ui_mode)
     if cache_plan.enabled:
         print(
@@ -1552,8 +1578,8 @@ def run_tts(
                 cache_key = cache_plan.keys.get(idx)
                 if cache_key is None:
                     continue
-                cache_file = cache_file_for_key(cache_plan.cache_dir, cache_key)
-                if restore_chunk_from_cache(cache_file, out_file):
+                cache_file = engine.cache.cache_file_for_key(cache_plan.cache_dir, cache_key)
+                if engine.cache.restore_chunk_from_cache(cache_file, out_file):
                     cache_hits += 1
 
         print("All chunk files already exist or were restored from cache. Nothing new to synthesize.")
@@ -1807,8 +1833,8 @@ def run_tts(
             "chapter_map_path": str(write_chapter_map) if write_chapter_map is not None else "",
         }
 
-    texttospeech = load_google_tts()
-    base_client = texttospeech.TextToSpeechClient()
+    texttospeech, base_client = engine.client_adapter.create()
+    
 
     voice = texttospeech.VoiceSelectionParams(
         language_code=lang,
@@ -1859,8 +1885,8 @@ def run_tts(
         if cache_plan.enabled:
             cache_key = cache_plan.keys.get(idx)
             if cache_key is not None:
-                cache_file = cache_file_for_key(cache_plan.cache_dir, cache_key)
-                if persist_chunk_to_cache(cache_file, audio):
+                cache_file = engine.cache.cache_file_for_key(cache_plan.cache_dir, cache_key)
+                if engine.cache.persist_chunk_to_cache(cache_file, audio):
                     cache_writes += 1
 
     pending_indices: list[int] = []
@@ -1874,7 +1900,7 @@ def run_tts(
         if cache_plan.enabled and idx in cache_plan.hit_candidates:
             cache_key = cache_plan.keys.get(idx)
             if cache_key is not None:
-                cache_file = cache_file_for_key(cache_plan.cache_dir, cache_key)
+                cache_file = engine.cache.cache_file_for_key(cache_plan.cache_dir, cache_key)
                 restored = restore_chunk_from_cache(cache_file, out_file)
 
         if restored:
