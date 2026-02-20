@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import html
 import importlib.util
+import json
 import os
 import random
 import re
@@ -11,6 +13,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -62,6 +65,19 @@ class MissingDependency:
     required: bool
     install_target: str | None
     install_tool: str | None
+
+
+@dataclass(frozen=True)
+class ChapterInfo:
+    index: int
+    title: str
+    start_paragraph: int
+
+
+@dataclass(frozen=True)
+class ChunkPlan:
+    text: str
+    chapter_index: int
 
 
 VOICE_PRICING_TABLE: dict[str, VoicePricing] = {
@@ -712,11 +728,16 @@ def synthesize_with_retries(
     text: str,
     voice: Any,
     audio_config: Any,
+    *,
+    use_ssml: bool,
 ) -> bytes:
     last_exc: Exception | None = None
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            synthesis_input = texttospeech.SynthesisInput(text=text)
+            if use_ssml:
+                synthesis_input = texttospeech.SynthesisInput(ssml=text)
+            else:
+                synthesis_input = texttospeech.SynthesisInput(text=text)
             resp = client.synthesize_speech(
                 input=synthesis_input,
                 voice=voice,
@@ -746,35 +767,58 @@ def synthesize_with_retries(
 def synthesize_with_adaptive_split(
     client: Any,
     texttospeech: Any,
-    text: str,
+    text_chunk: str,
     voice: Any,
     audio_config: Any,
+    *,
+    use_ssml: bool,
     depth: int = 0,
 ) -> bytes:
     """
     Try normal synthesis with retries; if input is still invalid, split recursively
     and concatenate child MP3 byte streams so caller still gets a single file.
     """
+    payload = shape_ssml_text(text_chunk) if use_ssml else text_chunk
+
     try:
-        return synthesize_with_retries(client, texttospeech, text, voice, audio_config)
+        return synthesize_with_retries(
+            client,
+            texttospeech,
+            payload,
+            voice,
+            audio_config,
+            use_ssml=use_ssml,
+        )
     except Exception as exc:  # noqa: BLE001
         if not is_invalid_argument_error(exc):
             raise
 
         if depth >= MAX_SPLIT_DEPTH:
             raise RuntimeError(
-                f"Max split depth reached ({MAX_SPLIT_DEPTH}) for chunk length {len(text)}"
+                f"Max split depth reached ({MAX_SPLIT_DEPTH}) for chunk length {len(text_chunk)}"
             ) from exc
 
-        pieces = split_for_retry(text)
+        pieces = split_for_retry(text_chunk)
         if len(pieces) <= 1:
             raise
 
         left = synthesize_with_adaptive_split(
-            client, texttospeech, pieces[0], voice, audio_config, depth=depth + 1
+            client,
+            texttospeech,
+            pieces[0],
+            voice,
+            audio_config,
+            use_ssml=use_ssml,
+            depth=depth + 1,
         )
         right = synthesize_with_adaptive_split(
-            client, texttospeech, pieces[1], voice, audio_config, depth=depth + 1
+            client,
+            texttospeech,
+            pieces[1],
+            voice,
+            audio_config,
+            use_ssml=use_ssml,
+            depth=depth + 1,
         )
         return left + right
 
@@ -827,48 +871,323 @@ def break_long_runs(t: str, max_run: int = 420) -> str:
     return "".join(out)
 
 
+def strip_citations_and_footnotes(t: str) -> str:
+    # Common inline citation forms: [12], [12-15], [12, 19]
+    t = re.sub(r"\[(?:\s*\d+[a-z]?(?:\s*[-,;]\s*\d+[a-z]?)*\s*)\]", "", t)
+
+    # Author-year citation forms: (Smith, 2020) or (Smith, 2020; Doe, 2021)
+    t = re.sub(
+        r"\((?:[A-ZÁÉÍÓÖŐÚÜŰ][^()]{1,60}?,\s*\d{4}[a-z]?"
+        r"(?:;\s*[A-ZÁÉÍÓÖŐÚÜŰ][^()]{1,60}?,\s*\d{4}[a-z]?){0,4})\)",
+        "",
+        t,
+    )
+
+    t = re.sub(r"\b\d{1,4}\s*[\)\]](?=\s|$)", "", t)
+    t = t.replace("¹", "").replace("²", "").replace("³", "").replace("⁴", "")
+    t = t.replace("⁵", "").replace("⁶", "").replace("⁷", "").replace("⁸", "").replace("⁹", "")
+    return t
+
+
+def is_chapter_heading(paragraph: str) -> bool:
+    p = paragraph.strip()
+    if not p or len(p) > 140:
+        return False
+
+    patterns = (
+        r"^(chapter|chap\.?|part)\s+[0-9ivxlcdm]+[\w .:-]*$",
+        r"^(fejezet|r[eé]sz)\s+[0-9ivxlcdm]+[\w .:-]*$",
+        r"^[0-9ivxlcdm]+\.\s*(chapter|fejezet|r[eé]sz)\b[\w .:-]*$",
+    )
+    if any(re.match(pattern, p, re.IGNORECASE) for pattern in patterns):
+        return True
+
+    compact = re.sub(r"[^A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű0-9 ]+", "", p).strip()
+    if compact and compact.isupper() and 3 <= len(compact.split()) <= 8:
+        return True
+
+    return False
+
+
 def clean_text(t: str) -> str:
     t = t.replace("\u00ad", "")  # soft hyphen
     t = re.sub(r"(\w)-\n(\w)", r"\1\2", t)  # fix hyphenation across lines
-    t = re.sub(r"(?<!\n)\n(?!\n)", " ", t)  # single newlines -> spaces
+    t = re.sub(r"https?://\S+", " ", t)
+    t = re.sub(r"\bwww\.\S+", " ", t)
+    t = re.sub(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", " ", t)
+    t = strip_citations_and_footnotes(t)
+
+    # Keep paragraph structure for chapter detection.
+    t = re.sub(r"\r\n?", "\n", t)
+    t = re.sub(r"(?<!\n)\n(?!\n)", " ", t)
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     t = t.strip()
 
+    # Trim bibliography/references tail when it appears near the end.
+    ref_match = re.search(r"\n\n(?:references|bibliography|irodalomjegyz[eé]k)\s*\n", t, re.IGNORECASE)
+    if ref_match and ref_match.start() > int(len(t) * 0.6):
+        t = t[: ref_match.start()].strip()
+
     # Critical: prevent "sentence too long" errors.
     t = break_long_runs(t, max_run=420)
-
     return t
 
 
-def chunk_by_paragraph(t: str, max_chars: int) -> list[str]:
-    paras = [p.strip() for p in t.split("\n\n") if p.strip()]
-    chunks = []
-    buf = []
-    size = 0
+def split_paragraphs(t: str) -> list[str]:
+    return [p.strip() for p in t.split("\n\n") if p.strip()]
 
-    for p in paras:
-        # If a single paragraph is huge, hard-split it.
-        if len(p) > max_chars:
-            if buf:
-                chunks.append("\n\n".join(buf))
-                buf, size = [], 0
-            for i in range(0, len(p), max_chars):
-                chunks.append(p[i : i + max_chars])
+
+def detect_chapters(paragraphs: list[str]) -> list[ChapterInfo]:
+    chapters: list[ChapterInfo] = []
+    for idx, paragraph in enumerate(paragraphs):
+        if is_chapter_heading(paragraph):
+            title = re.sub(r"\s+", " ", paragraph).strip()
+            chapters.append(ChapterInfo(index=len(chapters), title=title, start_paragraph=idx))
+
+    if not chapters:
+        return [ChapterInfo(index=0, title="Chapter 1", start_paragraph=0)]
+
+    if chapters[0].start_paragraph != 0:
+        chapters.insert(0, ChapterInfo(index=0, title="Chapter 1", start_paragraph=0))
+
+    normalized: list[ChapterInfo] = []
+    for item in chapters:
+        if normalized and normalized[-1].start_paragraph == item.start_paragraph:
+            continue
+        normalized.append(item)
+
+    return [
+        ChapterInfo(index=idx, title=item.title, start_paragraph=item.start_paragraph)
+        for idx, item in enumerate(normalized)
+    ]
+
+
+def chapter_for_paragraph(paragraph_index: int, chapters: list[ChapterInfo]) -> int:
+    current = 0
+    for idx, chapter in enumerate(chapters):
+        if chapter.start_paragraph <= paragraph_index:
+            current = idx
+        else:
+            break
+    return current
+
+
+def build_chunk_plan(
+    paragraphs: list[str],
+    max_chars: int,
+    chapters: list[ChapterInfo],
+) -> list[ChunkPlan]:
+    plans: list[ChunkPlan] = []
+    buf: list[str] = []
+    size = 0
+    buf_chapter = 0
+
+    def flush_buffer() -> None:
+        nonlocal buf, size
+        if not buf:
+            return
+        plans.append(ChunkPlan(text="\n\n".join(buf), chapter_index=buf_chapter))
+        buf = []
+        size = 0
+
+    for idx, paragraph in enumerate(paragraphs):
+        chapter_idx = chapter_for_paragraph(idx, chapters)
+
+        if len(paragraph) > max_chars:
+            flush_buffer()
+            for start in range(0, len(paragraph), max_chars):
+                plans.append(
+                    ChunkPlan(text=paragraph[start : start + max_chars], chapter_index=chapter_idx)
+                )
             continue
 
-        add = len(p) + (2 if buf else 0)
-        if size + add <= max_chars:
-            buf.append(p)
-            size += add
-        else:
-            chunks.append("\n\n".join(buf))
-            buf = [p]
-            size = len(p)
+        add = len(paragraph) + (2 if buf else 0)
+        if not buf:
+            buf = [paragraph]
+            size = len(paragraph)
+            buf_chapter = chapter_idx
+            continue
 
-    if buf:
-        chunks.append("\n\n".join(buf))
-    return chunks
+        if chapter_idx != buf_chapter or size + add > max_chars:
+            flush_buffer()
+            buf = [paragraph]
+            size = len(paragraph)
+            buf_chapter = chapter_idx
+            continue
+
+        buf.append(paragraph)
+        size += add
+
+    flush_buffer()
+    return plans
+
+
+def build_chapter_ranges(chapters: list[ChapterInfo], chunk_plan: list[ChunkPlan]) -> list[dict[str, Any]]:
+    if not chunk_plan:
+        return []
+
+    ranges: list[dict[str, Any]] = []
+    current_chapter = chunk_plan[0].chapter_index
+    start_chunk = 0
+
+    for idx, chunk in enumerate(chunk_plan[1:], start=1):
+        if chunk.chapter_index != current_chapter:
+            title = chapters[current_chapter].title if current_chapter < len(chapters) else f"Chapter {current_chapter + 1}"
+            ranges.append(
+                {
+                    "chapter_index": current_chapter,
+                    "title": title,
+                    "start_chunk": start_chunk,
+                    "end_chunk": idx - 1,
+                }
+            )
+            current_chapter = chunk.chapter_index
+            start_chunk = idx
+
+    title = chapters[current_chapter].title if current_chapter < len(chapters) else f"Chapter {current_chapter + 1}"
+    ranges.append(
+        {
+            "chapter_index": current_chapter,
+            "title": title,
+            "start_chunk": start_chunk,
+            "end_chunk": len(chunk_plan) - 1,
+        }
+    )
+    return ranges
+
+
+def shape_ssml_text(chunk_text: str) -> str:
+    paragraphs = split_paragraphs(chunk_text)
+    blocks: list[str] = []
+    for paragraph in paragraphs:
+        escaped = html.escape(paragraph, quote=False)
+        escaped = re.sub(r"([.!?…])\s+", r'\1<break time="350ms"/> ', escaped)
+        escaped = re.sub(r"([;:])\s+", r'\1<break time="220ms"/> ', escaped)
+        if is_chapter_heading(paragraph):
+            blocks.append(f"<p><emphasis level=\"moderate\">{escaped}</emphasis><break time=\"900ms\"/></p>")
+        else:
+            blocks.append(f"<p>{escaped}</p>")
+    return "<speak>" + "".join(blocks) + "</speak>"
+
+
+def enforce_run_limits(
+    preview: BillingPreview,
+    *,
+    max_chars_per_run: int | None,
+    max_cost_usd: float | None,
+) -> None:
+    if max_chars_per_run is not None and preview.pending_chars > max_chars_per_run:
+        raise RuntimeError(
+            f"Pending characters {preview.pending_chars:,} exceed max_chars_per_run={max_chars_per_run:,}."
+        )
+
+    if (
+        max_cost_usd is not None
+        and preview.estimated_cost_usd is not None
+        and preview.estimated_cost_usd > max_cost_usd
+    ):
+        raise RuntimeError(
+            "Estimated cost exceeds max_cost_usd: "
+            f"{format_usd(preview.estimated_cost_usd)} > {format_usd(max_cost_usd)}"
+        )
+
+
+def confirm_before_spend_gate(preview: BillingPreview, enabled: bool) -> None:
+    if not enabled or preview.pending_chars == 0:
+        return
+    if not sys.stdin.isatty():
+        raise RuntimeError("confirm-before-spend requires interactive terminal input.")
+
+    answer = input(
+        "Proceed with paid synthesis? "
+        f"Pending chars={preview.pending_chars:,}, estimated cost={format_usd(preview.estimated_cost_usd)} [y/N]: "
+    ).strip().lower()
+    if answer not in {"y", "yes"}:
+        raise RuntimeError("Synthesis cancelled by user at confirm-before-spend gate.")
+
+
+@contextmanager
+def dashboard_keyboard_mode(enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    try:
+        import termios
+        import tty
+    except Exception:  # noqa: BLE001
+        yield
+        return
+
+    fd = sys.stdin.fileno()
+    old_state = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    try:
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_state)
+
+
+def poll_dashboard_key() -> str | None:
+    if not sys.stdin.isatty():
+        return None
+    try:
+        import select
+    except Exception:  # noqa: BLE001
+        return None
+
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], 0)
+    except Exception:  # noqa: BLE001
+        return None
+    if not ready:
+        return None
+    try:
+        return sys.stdin.read(1)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def build_dashboard_view(
+    *,
+    preview: BillingPreview,
+    progress: Any,
+    generated: int,
+    skipped: int,
+    failures: int,
+    generated_chars: int,
+    paused: bool,
+    retry_requested: bool,
+    cancelled: bool,
+    current_chunk: str,
+    events: list[str],
+) -> Any:
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.table import Table
+
+    summary = Table(show_header=False, box=None, padding=(0, 1))
+    summary.add_row("Current Chunk", current_chunk)
+    summary.add_row("Generated", str(generated))
+    summary.add_row("Skipped", str(skipped))
+    summary.add_row("Failures", str(failures))
+    summary.add_row("Generated Chars", f"{generated_chars:,}")
+    summary.add_row("Pending Chars", f"{preview.pending_chars:,}")
+    summary.add_row("Estimated Cost", format_usd(preview.estimated_cost_usd))
+    summary.add_row("Paused", "yes" if paused else "no")
+    summary.add_row("Retry Failed", "armed" if retry_requested else "off")
+    summary.add_row("Cancelled", "yes" if cancelled else "no")
+
+    controls = "Controls: p pause/resume | r retry failed chunks after pass | q cancel"
+    events_text = "\n".join(events[-6:]) if events else "No events yet."
+
+    return Group(
+        Panel(summary, title="TTS Dashboard", expand=False),
+        progress,
+        Panel(controls, title="Controls", expand=False),
+        Panel(events_text, title="Events", expand=False),
+    )
 
 
 def run_tts(
@@ -885,6 +1204,12 @@ def run_tts(
     test_run: bool = False,
     test_delay: float = 0.02,
     test_write_placeholders: bool = False,
+    use_ssml: bool = True,
+    write_chapter_map: Path | None = None,
+    max_chars_per_run: int | None = None,
+    max_cost_usd: float | None = None,
+    confirm_before_spend: bool = False,
+    dashboard: bool = True,
 ) -> dict[str, int | float | str | bool]:
     if not input_txt.exists():
         raise RuntimeError(f"Missing {input_txt}. Provide a valid text file.")
@@ -893,15 +1218,36 @@ def run_tts(
 
     raw = input_txt.read_text(errors="ignore")
     text = clean_text(raw)
-    chunks = chunk_by_paragraph(text, max_chars)
+    paragraphs = split_paragraphs(text)
+    chapters = detect_chapters(paragraphs)
+    chunk_plan = build_chunk_plan(paragraphs, max_chars, chapters)
+    chunks = [chunk.text for chunk in chunk_plan]
+    chapter_ranges = build_chapter_ranges(chapters, chunk_plan)
 
     if write_cleaned is not None:
         write_cleaned.parent.mkdir(parents=True, exist_ok=True)
         write_cleaned.write_text(text)
 
+    if write_chapter_map is not None:
+        write_chapter_map.parent.mkdir(parents=True, exist_ok=True)
+        write_chapter_map.write_text(
+            json.dumps(
+                {
+                    "generated_at": datetime.now().isoformat(timespec="seconds"),
+                    "chunk_count": len(chunk_plan),
+                    "chapters": chapter_ranges,
+                },
+                indent=2,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+
     print(f"Input file: {input_txt}")
     print(f"Total cleaned chars: {len(text):,}")
     print(f"Chunks to synthesize: {len(chunks):,}")
+    print(f"Detected chapters: {len(chapter_ranges)}")
     print(f"Output folder: {out_dir.resolve()}")
 
     preview = build_billing_preview(
@@ -910,6 +1256,11 @@ def run_tts(
         out_dir=out_dir,
     )
     render_billing_preview(preview, ui_mode=ui_mode)
+    enforce_run_limits(
+        preview,
+        max_chars_per_run=max_chars_per_run,
+        max_cost_usd=max_cost_usd,
+    )
 
     if estimate_only:
         return {
@@ -923,6 +1274,8 @@ def run_tts(
             "estimated_pending_chars": preview.pending_chars,
             "estimated_billable_chars": preview.pending_chars,
             "estimated_cost_usd": float(preview.estimated_cost_usd or 0.0),
+            "chapters": len(chapter_ranges),
+            "chapter_map_path": str(write_chapter_map) if write_chapter_map is not None else "",
         }
 
     if preview.pending_chars == 0:
@@ -943,7 +1296,12 @@ def run_tts(
             "generated_chars": 0,
             "run_billable_chars": 0,
             "run_estimated_cost_usd": 0.0,
+            "chapters": len(chapter_ranges),
+            "chapter_map_path": str(write_chapter_map) if write_chapter_map is not None else "",
         }
+
+    if not test_run:
+        confirm_before_spend_gate(preview, enabled=confirm_before_spend)
 
     if test_run:
         if test_delay < 0:
@@ -952,9 +1310,120 @@ def run_tts(
         generated = 0
         skipped = 0
         generated_chars = 0
+        failures = 0
 
         use_rich = should_use_rich_ui(ui_mode)
-        if use_rich:
+        dashboard_enabled = use_rich and dashboard and sys.stdin.isatty() and sys.stdout.isatty()
+        if dashboard_enabled:
+            from rich.live import Live
+            from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeRemainingColumn
+
+            progress = Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeRemainingColumn(),
+            )
+            task = progress.add_task("Simulating", total=len(chunks))
+
+            paused = False
+            retry_requested = False
+            cancelled = False
+            current_chunk = "-"
+            events: list[str] = []
+
+            def handle_keys() -> None:
+                nonlocal paused, retry_requested, cancelled
+                while True:
+                    key = poll_dashboard_key()
+                    if key is None:
+                        return
+                    key = key.lower()
+                    if key == "p":
+                        paused = not paused
+                        events.append("Paused." if paused else "Resumed.")
+                    elif key == "r":
+                        retry_requested = True
+                        events.append("Retry flag enabled for failed chunks.")
+                    elif key == "q":
+                        cancelled = True
+                        events.append("Cancel requested.")
+
+            with dashboard_keyboard_mode(True):
+                with Live(
+                    build_dashboard_view(
+                        preview=preview,
+                        progress=progress,
+                        generated=generated,
+                        skipped=skipped,
+                        failures=failures,
+                        generated_chars=generated_chars,
+                        paused=paused,
+                        retry_requested=retry_requested,
+                        cancelled=cancelled,
+                        current_chunk=current_chunk,
+                        events=events,
+                    ),
+                    refresh_per_second=8,
+                ) as live:
+                    for idx, chunk in enumerate(chunks):
+                        handle_keys()
+                        while paused and not cancelled:
+                            handle_keys()
+                            live.update(
+                                build_dashboard_view(
+                                    preview=preview,
+                                    progress=progress,
+                                    generated=generated,
+                                    skipped=skipped,
+                                    failures=failures,
+                                    generated_chars=generated_chars,
+                                    paused=paused,
+                                    retry_requested=retry_requested,
+                                    cancelled=cancelled,
+                                    current_chunk=current_chunk,
+                                    events=events,
+                                )
+                            )
+                            time.sleep(0.1)
+
+                        if cancelled:
+                            raise RuntimeError("Cancelled from dashboard.")
+
+                        current_chunk = f"{idx + 1}/{len(chunks)}"
+                        out_file = out_dir / f"{idx:04d}.mp3"
+                        if out_file.exists() and out_file.stat().st_size > 0:
+                            skipped += 1
+                            progress.advance(task)
+                            events.append(f"Skipped {out_file.name} (already exists).")
+                            continue
+
+                        if test_delay > 0:
+                            time.sleep(test_delay)
+                        if test_write_placeholders:
+                            out_file.write_bytes(b"FAKE_MP3_PLACEHOLDER")
+                        generated += 1
+                        generated_chars += len(chunk)
+                        progress.advance(task)
+                        if generated % 25 == 0:
+                            events.append(f"Simulated {generated}/{len(chunks)} chunks.")
+
+                        live.update(
+                            build_dashboard_view(
+                                preview=preview,
+                                progress=progress,
+                                generated=generated,
+                                skipped=skipped,
+                                failures=failures,
+                                generated_chars=generated_chars,
+                                paused=paused,
+                                retry_requested=retry_requested,
+                                cancelled=cancelled,
+                                current_chunk=current_chunk,
+                                events=events,
+                            )
+                        )
+        elif use_rich:
             from rich.progress import (
                 BarColumn,
                 MofNCompleteColumn,
@@ -1024,6 +1493,8 @@ def run_tts(
             "generated_chars": generated_chars,
             "run_billable_chars": generated_chars,
             "run_estimated_cost_usd": float(run_estimated_cost_usd or 0.0),
+            "chapters": len(chapter_ranges),
+            "chapter_map_path": str(write_chapter_map) if write_chapter_map is not None else "",
         }
 
     texttospeech = load_google_tts()
@@ -1041,13 +1512,201 @@ def run_tts(
     )
 
     failures: list[tuple[str, str]] = []
+    failed_indices: list[int] = []
     generated = 0
     skipped = 0
     generated_chars = 0
 
     use_rich = should_use_rich_ui(ui_mode)
+    dashboard_enabled = use_rich and dashboard and sys.stdin.isatty() and sys.stdout.isatty()
 
-    if use_rich:
+    if dashboard_enabled:
+        from rich.live import Live
+        from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeRemainingColumn
+
+        progress = Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeRemainingColumn(),
+        )
+        task = progress.add_task("Synthesizing", total=len(chunks))
+
+        paused = False
+        retry_requested = False
+        cancelled = False
+        current_chunk = "-"
+        events: list[str] = []
+
+        def handle_keys() -> None:
+            nonlocal paused, retry_requested, cancelled
+            while True:
+                key = poll_dashboard_key()
+                if key is None:
+                    return
+                key = key.lower()
+                if key == "p":
+                    paused = not paused
+                    events.append("Paused." if paused else "Resumed.")
+                elif key == "r":
+                    retry_requested = True
+                    events.append("Retry flag enabled for failed chunks.")
+                elif key == "q":
+                    cancelled = True
+                    events.append("Cancel requested.")
+
+        with dashboard_keyboard_mode(True):
+            with Live(
+                build_dashboard_view(
+                    preview=preview,
+                    progress=progress,
+                    generated=generated,
+                    skipped=skipped,
+                    failures=len(failures),
+                    generated_chars=generated_chars,
+                    paused=paused,
+                    retry_requested=retry_requested,
+                    cancelled=cancelled,
+                    current_chunk=current_chunk,
+                    events=events,
+                ),
+                refresh_per_second=8,
+            ) as live:
+                for idx, chunk in enumerate(chunks):
+                    handle_keys()
+                    while paused and not cancelled:
+                        handle_keys()
+                        live.update(
+                            build_dashboard_view(
+                                preview=preview,
+                                progress=progress,
+                                generated=generated,
+                                skipped=skipped,
+                                failures=len(failures),
+                                generated_chars=generated_chars,
+                                paused=paused,
+                                retry_requested=retry_requested,
+                                cancelled=cancelled,
+                                current_chunk=current_chunk,
+                                events=events,
+                            )
+                        )
+                        time.sleep(0.1)
+
+                    if cancelled:
+                        raise RuntimeError("Cancelled from dashboard.")
+
+                    stem = f"{idx:04d}"
+                    current_chunk = f"{idx + 1}/{len(chunks)}"
+                    out_file = out_dir / f"{stem}.mp3"
+                    if out_file.exists() and out_file.stat().st_size > 0:
+                        skipped += 1
+                        progress.advance(task)
+                        events.append(f"Skipped {stem}.mp3 (already exists).")
+                        continue
+
+                    try:
+                        audio = synthesize_with_adaptive_split(
+                            client,
+                            texttospeech,
+                            chunk,
+                            voice,
+                            audio_config,
+                            use_ssml=use_ssml,
+                            depth=0,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        failures.append((stem, str(exc)))
+                        failed_indices.append(idx)
+                        events.append(f"Failed {stem}: {exc}")
+                        progress.advance(task)
+                        live.update(
+                            build_dashboard_view(
+                                preview=preview,
+                                progress=progress,
+                                generated=generated,
+                                skipped=skipped,
+                                failures=len(failures),
+                                generated_chars=generated_chars,
+                                paused=paused,
+                                retry_requested=retry_requested,
+                                cancelled=cancelled,
+                                current_chunk=current_chunk,
+                                events=events,
+                            )
+                        )
+                        continue
+
+                    tmp_file = out_file.with_suffix(".mp3.tmp")
+                    tmp_file.write_bytes(audio)
+                    tmp_file.replace(out_file)
+                    generated += 1
+                    generated_chars += len(chunk)
+                    progress.advance(task)
+                    if generated % 25 == 0:
+                        events.append(f"Generated {generated}/{len(chunks)} chunks.")
+
+                    live.update(
+                        build_dashboard_view(
+                            preview=preview,
+                            progress=progress,
+                            generated=generated,
+                            skipped=skipped,
+                            failures=len(failures),
+                            generated_chars=generated_chars,
+                            paused=paused,
+                            retry_requested=retry_requested,
+                            cancelled=cancelled,
+                            current_chunk=current_chunk,
+                            events=events,
+                        )
+                    )
+
+                if retry_requested and failed_indices:
+                    retry_task = progress.add_task("Retry failed", total=len(failed_indices))
+                    for idx in list(failed_indices):
+                        handle_keys()
+                        while paused and not cancelled:
+                            handle_keys()
+                            time.sleep(0.1)
+                        if cancelled:
+                            raise RuntimeError("Cancelled from dashboard.")
+
+                        stem = f"{idx:04d}"
+                        out_file = out_dir / f"{stem}.mp3"
+                        if out_file.exists() and out_file.stat().st_size > 0:
+                            progress.advance(retry_task)
+                            continue
+
+                        try:
+                            audio = synthesize_with_adaptive_split(
+                                client,
+                                texttospeech,
+                                chunks[idx],
+                                voice,
+                                audio_config,
+                                use_ssml=use_ssml,
+                                depth=0,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            for pos, (failed_stem, _) in enumerate(failures):
+                                if failed_stem == stem:
+                                    failures[pos] = (failed_stem, str(exc))
+                                    break
+                            progress.advance(retry_task)
+                            events.append(f"Retry failed {stem}: {exc}")
+                            continue
+
+                        tmp_file = out_file.with_suffix(".mp3.tmp")
+                        tmp_file.write_bytes(audio)
+                        tmp_file.replace(out_file)
+                        generated += 1
+                        generated_chars += len(chunks[idx])
+                        failures = [item for item in failures if item[0] != stem]
+                        progress.advance(retry_task)
+                        events.append(f"Retry succeeded {stem}.")
+
+    elif use_rich:
         from rich.progress import (
             BarColumn,
             MofNCompleteColumn,
@@ -1074,10 +1733,17 @@ def run_tts(
 
                 try:
                     audio = synthesize_with_adaptive_split(
-                        client, texttospeech, chunk, voice, audio_config, depth=0
+                        client,
+                        texttospeech,
+                        chunk,
+                        voice,
+                        audio_config,
+                        use_ssml=use_ssml,
+                        depth=0,
                     )
                 except Exception as exc:  # noqa: BLE001
                     failures.append((stem, str(exc)))
+                    failed_indices.append(idx)
                     progress.console.log(f"Failed {stem}: {exc}")
                     progress.advance(task)
                     continue
@@ -1098,10 +1764,17 @@ def run_tts(
 
             try:
                 audio = synthesize_with_adaptive_split(
-                    client, texttospeech, chunk, voice, audio_config, depth=0
+                    client,
+                    texttospeech,
+                    chunk,
+                    voice,
+                    audio_config,
+                    use_ssml=use_ssml,
+                    depth=0,
                 )
             except Exception as exc:  # noqa: BLE001
                 failures.append((stem, str(exc)))
+                failed_indices.append(idx)
                 print(f"Failed {stem}: {exc}")
                 continue
 
@@ -1146,6 +1819,8 @@ def run_tts(
         "generated_chars": generated_chars,
         "run_billable_chars": int(run_billable_chars or 0),
         "run_estimated_cost_usd": float(run_estimated_cost_usd or 0.0),
+        "chapters": len(chapter_ranges),
+        "chapter_map_path": str(write_chapter_map) if write_chapter_map is not None else "",
     }
 
 
@@ -1242,6 +1917,42 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="In --test-run mode, create placeholder .mp3 files for resume demo",
     )
+    parser.add_argument(
+        "--use-ssml",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Shape chunk text into SSML before synthesis",
+    )
+    parser.add_argument(
+        "--dashboard",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable full-screen rich dashboard with pause/resume controls",
+    )
+    parser.add_argument(
+        "--max-cost-usd",
+        type=float,
+        default=None,
+        help="Hard limit: stop if estimated run cost exceeds this amount",
+    )
+    parser.add_argument(
+        "--max-chars-per-run",
+        type=int,
+        default=None,
+        help="Hard limit: stop if pending chars exceed this count",
+    )
+    parser.add_argument(
+        "--confirm-before-spend",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Ask for explicit confirmation before real (paid) synthesis",
+    )
+    parser.add_argument(
+        "--write-chapter-map",
+        type=Path,
+        default=None,
+        help="Optional path to write chapter-to-chunk mapping JSON",
+    )
     return parser
 
 
@@ -1268,6 +1979,12 @@ def main() -> None:
             test_run=args.test_run,
             test_delay=args.test_delay,
             test_write_placeholders=args.test_write_placeholders,
+            use_ssml=bool(args.use_ssml),
+            write_chapter_map=args.write_chapter_map,
+            max_chars_per_run=args.max_chars_per_run,
+            max_cost_usd=args.max_cost_usd,
+            confirm_before_spend=bool(args.confirm_before_spend),
+            dashboard=bool(args.dashboard),
         )
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from exc

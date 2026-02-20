@@ -8,12 +8,29 @@ out_dir = "out"
 [pipeline]
 ocr = "auto"
 ocr_lang = "hun+eng"
+# Tuned defaults for mixed academic books (tables/figures + prose).
+ocr_page_min_chars = 30
+ocr_page_min_alpha_ratio = 0.22
+ocr_page_max_replacement_ratio = 0.02
+ocr_page_min_score = 0.24
+ocr_auto_bad_page_ratio = 0.10
 lang = "hu-HU"
 voice_name = "hu-HU-Chirp3-HD-Erinome"
 max_chars = 3500
 speaking_rate = 1.0
 pitch = 0.0
 ui = "auto"
+use_ssml = true
+cleanup_diff_preview = true
+cleanup_diff_max_lines = 200
+dashboard = true
+export_m4b = true
+
+[limits]
+# Set to null (or remove) for no hard limit.
+max_chars_per_run = 20000000
+max_cost_usd = 40.0
+confirm_before_spend = true
 
 [flags]
 skip_tts = false

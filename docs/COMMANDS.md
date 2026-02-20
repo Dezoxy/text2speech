@@ -58,6 +58,11 @@ python3 pipeline.py --ocr auto
 python3 pipeline.py --ocr always
 python3 pipeline.py --ocr never
 python3 pipeline.py --ocr-lang hun+eng
+python3 pipeline.py --ocr-page-min-chars 30
+python3 pipeline.py --ocr-page-min-alpha-ratio 0.22
+python3 pipeline.py --ocr-page-max-replacement-ratio 0.02
+python3 pipeline.py --ocr-page-min-score 0.24
+python3 pipeline.py --ocr-auto-bad-page-ratio 0.10
 ```
 
 ### Output/workflow controls
@@ -76,6 +81,11 @@ python3 pipeline.py --job-name my-book
 ```bash
 python3 pipeline.py --lang hu-HU --voice-name hu-HU-Chirp3-HD-Erinome
 python3 pipeline.py --max-chars 3500 --speaking-rate 1.0 --pitch 0.0
+python3 pipeline.py --use-ssml
+python3 pipeline.py --no-use-ssml
+python3 pipeline.py --cleanup-diff-preview
+python3 pipeline.py --no-cleanup-diff-preview
+python3 pipeline.py --cleanup-diff-max-lines 300
 ```
 
 ### UI and estimate
@@ -83,8 +93,32 @@ python3 pipeline.py --max-chars 3500 --speaking-rate 1.0 --pitch 0.0
 ```bash
 python3 pipeline.py --ui auto
 python3 pipeline.py --ui rich
+python3 pipeline.py --ui rich --dashboard
+python3 pipeline.py --ui rich --no-dashboard
 python3 pipeline.py --estimate-only
 python3 pipeline.py --no-estimate-only
+```
+
+Dashboard runtime keys (rich dashboard):
+
+- `p` pause/resume
+- `r` retry failed chunks after the first pass
+- `q` cancel run
+
+### Cost/safety gates
+
+```bash
+python3 pipeline.py --max-chars-per-run 500000
+python3 pipeline.py --max-cost-usd 10
+python3 pipeline.py --confirm-before-spend
+python3 pipeline.py --no-confirm-before-spend
+```
+
+### Output formats
+
+```bash
+python3 pipeline.py --export-m4b
+python3 pipeline.py --no-export-m4b
 ```
 
 ### Fake test workflow (no Google API calls)
@@ -123,6 +157,10 @@ python3 pipeline.py --resume-job work/tmp/<job-folder>/job_manifest.json
 
 ```bash
 python3 make_mp3.py --input /path/to/book.txt --output-dir out_mp3
+python3 make_mp3.py --input /path/to/book.txt --use-ssml
+python3 make_mp3.py --input /path/to/book.txt --ui rich --dashboard
+python3 make_mp3.py --input /path/to/book.txt --max-chars-per-run 500000 --max-cost-usd 10
+python3 make_mp3.py --input /path/to/book.txt --confirm-before-spend
 ```
 
 ### Estimate only
