@@ -8,6 +8,8 @@ Automate book conversion from PDF/TXT to audiobook MP3 using Google Cloud Text-t
 - New to the project: read `docs/PROJECT_BOOK.md` (step-by-step handbook).
 - Hungarian handbook: read `docs/PROJECT_BOOK.hu.md`.
 - Need commands quickly: use `docs/COMMANDS.md` (explained command reference).
+- Working on code: read `docs/DEVELOPER_WORKFLOW.md`.
+- Migration notes: read `docs/MIGRATION.md`.
 
 ## Folder Layout
 
@@ -48,6 +50,8 @@ CLI args always override config values.
 - `docs/PROJECT_BOOK.md`: beginner-friendly walkthrough.
 - `docs/PROJECT_BOOK.hu.md`: Hungarian handbook.
 - `docs/COMMANDS.md`: detailed command guide with what/when/expected-result notes.
+- `docs/DEVELOPER_WORKFLOW.md`: module map + developer workflow + smoke tests.
+- `docs/MIGRATION.md`: compatibility and migration notes.
 
 ## System Requirements
 
@@ -85,6 +89,20 @@ Direct script mode is still supported:
 python3 pipeline.py --help
 python3 make_mp3.py --help
 ```
+
+
+## Module Map + Developer Workflow
+
+For contributors, the module map and refactor workflow are documented in:
+
+- `docs/DEVELOPER_WORKFLOW.md`
+- `docs/MIGRATION.md`
+
+This includes:
+
+- package module ownership (`pipeline_app`, `make_mp3_app`, `shared/*`)
+- backward-compatible wrapper expectations
+- required lint/test/smoke validation commands
 
 Install local command-line tools used by the pipeline:
 
