@@ -19,6 +19,8 @@ venv/
 
 # Project-generated outputs
 out_mp3/
+out/
+work/
 *.mp3
 *.mp3.tmp
 concat_list.txt

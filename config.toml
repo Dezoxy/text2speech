@@ -1,0 +1,24 @@
+# text2speech default configuration
+
+[paths]
+input = "input"
+work_dir = "work"
+out_dir = "out"
+
+[pipeline]
+ocr = "auto"
+ocr_lang = "hun+eng"
+lang = "hu-HU"
+voice_name = "hu-HU-Chirp3-HD-Erinome"
+max_chars = 3500
+speaking_rate = 1.0
+pitch = 0.0
+ui = "auto"
+
+[flags]
+skip_tts = false
+skip_merge = false
+estimate_only = false
+test_run = false
+test_delay = 0.02
+test_write_placeholders = false
