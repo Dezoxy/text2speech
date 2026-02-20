@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import hashlib
 import html
 import importlib.util
 import json
@@ -11,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from contextlib import contextmanager
@@ -18,6 +21,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from text2speech_version import get_version
 
 # ---- Defaults (override via CLI args) ----
 PDF_TXT = Path("book.txt")
@@ -79,6 +84,47 @@ class ChunkPlan:
     text: str
     chapter_index: int
 
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    attempts: int
+    base_delay_s: float
+    backoff_factor: float
+    max_delay_s: float
+    jitter_s: float
+
+
+@dataclass(frozen=True)
+class ChunkCachePlan:
+    cache_dir: Path
+    enabled: bool
+    keys: dict[int, str]
+    hit_candidates: set[int]
+    hit_candidate_chars: int
+
+
+class RateLimiter:
+    def __init__(self, rate_limit_rps: float | None) -> None:
+        if rate_limit_rps is None or rate_limit_rps <= 0:
+            self._interval = 0.0
+        else:
+            self._interval = 1.0 / rate_limit_rps
+        self._lock = threading.Lock()
+        self._next_time = 0.0
+
+    def acquire(self) -> None:
+        if self._interval <= 0:
+            return
+
+        wait_s = 0.0
+        with self._lock:
+            now = time.monotonic()
+            if self._next_time > now:
+                wait_s = self._next_time - now
+            self._next_time = max(self._next_time, now) + self._interval
+
+        if wait_s > 0:
+            time.sleep(wait_s)
 
 VOICE_PRICING_TABLE: dict[str, VoicePricing] = {
     # Prices from Google Cloud pricing page.
@@ -156,6 +202,77 @@ def parse_string_map(value: Any, field_name: str, source: Path) -> dict[str, str
         if key_clean and item_clean:
             parsed[key_clean] = item_clean
     return parsed
+
+
+def normalize_aliases_map(value: dict[str, Any] | None) -> dict[str, str]:
+    if not value:
+        return {}
+    parsed: dict[str, str] = {}
+    for raw_key, raw_value in value.items():
+        if not isinstance(raw_key, str) or not isinstance(raw_value, str):
+            continue
+        key = raw_key.strip()
+        alias = raw_value.strip()
+        if key and alias:
+            parsed[key] = alias
+    return parsed
+
+
+def parse_csv_items(value: str | None) -> list[str]:
+    if value is None:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def load_pronunciation_aliases_file(path: Path) -> dict[str, str]:
+    if not path.exists():
+        raise RuntimeError(f"Pronunciation dictionary file does not exist: {path}")
+
+    suffix = path.suffix.lower()
+    if suffix == ".toml":
+        try:
+            with path.open("rb") as fh:
+                data = tomllib.load(fh)
+        except tomllib.TOMLDecodeError as exc:
+            raise RuntimeError(f"Invalid TOML in pronunciation file {path}: {exc}") from exc
+
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Pronunciation file must be a TOML table: {path}")
+        aliases_obj = data.get("aliases", data)
+        if not isinstance(aliases_obj, dict):
+            raise RuntimeError(f"Pronunciation aliases must be a TOML table in {path}")
+        return normalize_aliases_map(aliases_obj)
+
+    if suffix == ".json":
+        try:
+            data = json.loads(path.read_text())
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Invalid JSON in pronunciation file {path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Pronunciation file must be a JSON object: {path}")
+        aliases_obj = data.get("aliases", data)
+        if not isinstance(aliases_obj, dict):
+            raise RuntimeError(f"Pronunciation aliases must be an object in {path}")
+        return normalize_aliases_map(aliases_obj)
+
+    aliases: dict[str, str] = {}
+    for line in path.read_text(errors="ignore").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in stripped:
+            continue
+        key, alias = stripped.split("=", 1)
+        key = key.strip()
+        alias = alias.strip()
+        if key and alias:
+            aliases[key] = alias
+    if not aliases:
+        raise RuntimeError(
+            f"Unsupported or empty pronunciation file format for {path}. "
+            "Use .toml/.json or key=value text lines."
+        )
+    return aliases
 
 
 def load_dependencies(path: Path) -> dict[str, Any]:
@@ -490,6 +607,130 @@ def format_usd(value: float | None) -> str:
     return f"${value:,.4f}"
 
 
+def build_chunk_cache_key(
+    *,
+    text: str,
+    lang: str,
+    voice_name: str,
+    speaking_rate: float,
+    pitch: float,
+    use_ssml: bool,
+    ssml_profile_signature: str,
+) -> str:
+    payload = {
+        "schema": "tts-cache-v2",
+        "text": text,
+        "lang": lang,
+        "voice_name": voice_name,
+        "speaking_rate": speaking_rate,
+        "pitch": pitch,
+        "use_ssml": bool(use_ssml),
+        "ssml_profile_signature": ssml_profile_signature,
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def cache_file_for_key(cache_dir: Path, cache_key: str) -> Path:
+    return cache_dir / f"{cache_key}.mp3"
+
+
+def restore_chunk_from_cache(cache_file: Path, out_file: Path) -> bool:
+    if not cache_file.exists() or cache_file.stat().st_size == 0:
+        return False
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = out_file.with_suffix(".mp3.tmp")
+    shutil.copyfile(cache_file, tmp_file)
+    tmp_file.replace(out_file)
+    return True
+
+
+def persist_chunk_to_cache(cache_file: Path, audio: bytes) -> bool:
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    if cache_file.exists() and cache_file.stat().st_size > 0:
+        return False
+    tmp_file = cache_file.with_suffix(".mp3.tmp")
+    tmp_file.write_bytes(audio)
+    tmp_file.replace(cache_file)
+    return True
+
+
+def plan_chunk_cache(
+    *,
+    chunks: list[str],
+    out_dir: Path,
+    cache_dir: Path,
+    enabled: bool,
+    lang: str,
+    voice_name: str,
+    speaking_rate: float,
+    pitch: float,
+    use_ssml: bool,
+    ssml_profile_signature: str,
+) -> ChunkCachePlan:
+    keys: dict[int, str] = {}
+    hit_candidates: set[int] = set()
+    hit_chars = 0
+    if not enabled:
+        return ChunkCachePlan(
+            cache_dir=cache_dir,
+            enabled=False,
+            keys=keys,
+            hit_candidates=hit_candidates,
+            hit_candidate_chars=0,
+        )
+
+    for idx, chunk in enumerate(chunks):
+        out_file = out_dir / f"{idx:04d}.mp3"
+        if out_file.exists() and out_file.stat().st_size > 0:
+            continue
+        cache_key = build_chunk_cache_key(
+            text=chunk,
+            lang=lang,
+            voice_name=voice_name,
+            speaking_rate=speaking_rate,
+            pitch=pitch,
+            use_ssml=use_ssml,
+            ssml_profile_signature=ssml_profile_signature,
+        )
+        keys[idx] = cache_key
+        cache_file = cache_file_for_key(cache_dir, cache_key)
+        if cache_file.exists() and cache_file.stat().st_size > 0:
+            hit_candidates.add(idx)
+            hit_chars += len(chunk)
+
+    return ChunkCachePlan(
+        cache_dir=cache_dir,
+        enabled=True,
+        keys=keys,
+        hit_candidates=hit_candidates,
+        hit_candidate_chars=hit_chars,
+    )
+
+
+def adjust_preview_for_cache_candidates(preview: BillingPreview, cache_plan: ChunkCachePlan) -> BillingPreview:
+    if not cache_plan.enabled or cache_plan.hit_candidate_chars <= 0:
+        return preview
+
+    pending_chars = max(0, preview.pending_chars - cache_plan.hit_candidate_chars)
+    skipped_chars = preview.total_chars - pending_chars
+    if preview.voice_pricing.usd_per_char is None:
+        estimated_cost_usd = None
+    else:
+        estimated_cost_usd = pending_chars * preview.voice_pricing.usd_per_char
+
+    return BillingPreview(
+        project_id=preview.project_id,
+        month_key=preview.month_key,
+        voice_name=preview.voice_name,
+        voice_pricing=preview.voice_pricing,
+        total_chars=preview.total_chars,
+        pending_chars=pending_chars,
+        skipped_chars=skipped_chars,
+        estimated_cost_usd=estimated_cost_usd,
+    )
+
+
 def build_billing_preview(
     *,
     voice_name: str,
@@ -730,10 +971,14 @@ def synthesize_with_retries(
     audio_config: Any,
     *,
     use_ssml: bool,
+    retry_policy: RetryPolicy,
+    rate_limiter: RateLimiter | None,
 ) -> bytes:
     last_exc: Exception | None = None
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
+    for attempt in range(1, retry_policy.attempts + 1):
         try:
+            if rate_limiter is not None:
+                rate_limiter.acquire()
             if use_ssml:
                 synthesis_input = texttospeech.SynthesisInput(ssml=text)
             else:
@@ -750,15 +995,18 @@ def synthesize_with_retries(
             last_exc = exc
             if is_invalid_argument_error(exc):
                 raise
-            if attempt >= RETRY_ATTEMPTS or not is_retryable_error(exc):
+            if attempt >= retry_policy.attempts or not is_retryable_error(exc):
                 raise
 
-            sleep_s = min(30.0, (1.8**attempt) + random.uniform(0.0, 0.25))
+            exp_delay = retry_policy.base_delay_s * (retry_policy.backoff_factor ** max(0, attempt - 1))
+            jitter = random.uniform(0.0, retry_policy.jitter_s) if retry_policy.jitter_s > 0 else 0.0
+            sleep_s = min(retry_policy.max_delay_s, exp_delay + jitter)
             print(
-                f"Retry {attempt}/{RETRY_ATTEMPTS} after error: {exc}. "
+                f"Retry {attempt}/{retry_policy.attempts} after error: {exc}. "
                 f"Sleeping {sleep_s:.1f}s."
             )
-            time.sleep(sleep_s)
+            if sleep_s > 0:
+                time.sleep(sleep_s)
 
     assert last_exc is not None
     raise last_exc
@@ -772,13 +1020,35 @@ def synthesize_with_adaptive_split(
     audio_config: Any,
     *,
     use_ssml: bool,
+    pronunciation_aliases: dict[str, str],
+    pronunciation_case_sensitive: bool,
+    acronym_mode: str,
+    acronym_min_len: int,
+    acronym_max_len: int,
+    acronym_include: set[str],
+    acronym_exclude: set[str],
+    retry_policy: RetryPolicy,
+    rate_limiter: RateLimiter | None,
     depth: int = 0,
 ) -> bytes:
     """
     Try normal synthesis with retries; if input is still invalid, split recursively
     and concatenate child MP3 byte streams so caller still gets a single file.
     """
-    payload = shape_ssml_text(text_chunk) if use_ssml else text_chunk
+    payload = (
+        shape_ssml_text(
+            text_chunk,
+            pronunciation_aliases=pronunciation_aliases,
+            pronunciation_case_sensitive=pronunciation_case_sensitive,
+            acronym_mode=acronym_mode,
+            acronym_min_len=acronym_min_len,
+            acronym_max_len=acronym_max_len,
+            acronym_include=acronym_include,
+            acronym_exclude=acronym_exclude,
+        )
+        if use_ssml
+        else text_chunk
+    )
 
     try:
         return synthesize_with_retries(
@@ -788,6 +1058,8 @@ def synthesize_with_adaptive_split(
             voice,
             audio_config,
             use_ssml=use_ssml,
+            retry_policy=retry_policy,
+            rate_limiter=rate_limiter,
         )
     except Exception as exc:  # noqa: BLE001
         if not is_invalid_argument_error(exc):
@@ -809,6 +1081,15 @@ def synthesize_with_adaptive_split(
             voice,
             audio_config,
             use_ssml=use_ssml,
+            pronunciation_aliases=pronunciation_aliases,
+            pronunciation_case_sensitive=pronunciation_case_sensitive,
+            acronym_mode=acronym_mode,
+            acronym_min_len=acronym_min_len,
+            acronym_max_len=acronym_max_len,
+            acronym_include=acronym_include,
+            acronym_exclude=acronym_exclude,
+            retry_policy=retry_policy,
+            rate_limiter=rate_limiter,
             depth=depth + 1,
         )
         right = synthesize_with_adaptive_split(
@@ -818,6 +1099,15 @@ def synthesize_with_adaptive_split(
             voice,
             audio_config,
             use_ssml=use_ssml,
+            pronunciation_aliases=pronunciation_aliases,
+            pronunciation_case_sensitive=pronunciation_case_sensitive,
+            acronym_mode=acronym_mode,
+            acronym_min_len=acronym_min_len,
+            acronym_max_len=acronym_max_len,
+            acronym_include=acronym_include,
+            acronym_exclude=acronym_exclude,
+            retry_policy=retry_policy,
+            rate_limiter=rate_limiter,
             depth=depth + 1,
         )
         return left + right
@@ -1057,17 +1347,151 @@ def build_chapter_ranges(chapters: list[ChapterInfo], chunk_plan: list[ChunkPlan
     return ranges
 
 
-def shape_ssml_text(chunk_text: str) -> str:
+def insert_ssml_breaks(escaped_text: str) -> str:
+    escaped_text = re.sub(r"([.!?…])\s+", r'\1<break time="350ms"/> ', escaped_text)
+    escaped_text = re.sub(r"([;:])\s+", r'\1<break time="220ms"/> ', escaped_text)
+    return escaped_text
+
+
+def token_is_spelled_acronym(
+    token: str,
+    *,
+    mode: str,
+    min_len: int,
+    max_len: int,
+    include: set[str],
+    exclude: set[str],
+) -> bool:
+    upper = token.upper()
+    if upper in exclude:
+        return False
+
+    if mode == "off":
+        return False
+    if mode == "list":
+        return upper in include
+
+    if upper in include:
+        return True
+    if not token.isalpha():
+        return False
+    if token != upper:
+        return False
+    if len(token) < min_len or len(token) > max_len:
+        return False
+    if re.fullmatch(r"[IVXLCDM]+", token):
+        return False
+    return True
+
+
+def render_ssml_paragraph(
+    paragraph: str,
+    *,
+    pronunciation_aliases: dict[str, str],
+    pronunciation_case_sensitive: bool,
+    acronym_mode: str,
+    acronym_min_len: int,
+    acronym_max_len: int,
+    acronym_include: set[str],
+    acronym_exclude: set[str],
+) -> str:
+    spans: list[tuple[int, int, str]] = []
+
+    def overlaps(start: int, end: int) -> bool:
+        for s_start, s_end, _ in spans:
+            if not (end <= s_start or start >= s_end):
+                return True
+        return False
+
+    if pronunciation_aliases:
+        flags = 0 if pronunciation_case_sensitive else re.IGNORECASE
+        for term, alias in sorted(pronunciation_aliases.items(), key=lambda item: len(item[0]), reverse=True):
+            pattern = re.compile(rf"(?<!\w){re.escape(term)}(?!\w)", flags)
+            alias_escaped = html.escape(alias, quote=True)
+            for match in pattern.finditer(paragraph):
+                start, end = match.span()
+                if overlaps(start, end):
+                    continue
+                matched_text = html.escape(match.group(0), quote=False)
+                spans.append(
+                    (
+                        start,
+                        end,
+                        f'<sub alias="{alias_escaped}">{matched_text}</sub>',
+                    )
+                )
+
+    acronym_pattern = re.compile(r"\b([A-Z]{2,12})\b")
+    for match in acronym_pattern.finditer(paragraph):
+        token = match.group(1)
+        start, end = match.span(1)
+        if overlaps(start, end):
+            continue
+        if not token_is_spelled_acronym(
+            token,
+            mode=acronym_mode,
+            min_len=acronym_min_len,
+            max_len=acronym_max_len,
+            include=acronym_include,
+            exclude=acronym_exclude,
+        ):
+            continue
+        token_escaped = html.escape(token, quote=False)
+        spans.append(
+            (
+                start,
+                end,
+                f'<say-as interpret-as="characters">{token_escaped}</say-as>',
+            )
+        )
+
+    if not spans:
+        return insert_ssml_breaks(html.escape(paragraph, quote=False))
+
+    spans.sort(key=lambda item: item[0])
+    out: list[str] = []
+    cursor = 0
+    for start, end, replacement in spans:
+        if start > cursor:
+            out.append(insert_ssml_breaks(html.escape(paragraph[cursor:start], quote=False)))
+        out.append(replacement)
+        cursor = end
+    if cursor < len(paragraph):
+        out.append(insert_ssml_breaks(html.escape(paragraph[cursor:], quote=False)))
+    return "".join(out)
+
+
+def shape_ssml_text(
+    chunk_text: str,
+    *,
+    pronunciation_aliases: dict[str, str] | None = None,
+    pronunciation_case_sensitive: bool = False,
+    acronym_mode: str = "auto",
+    acronym_min_len: int = 2,
+    acronym_max_len: int = 5,
+    acronym_include: set[str] | None = None,
+    acronym_exclude: set[str] | None = None,
+) -> str:
     paragraphs = split_paragraphs(chunk_text)
+    aliases = pronunciation_aliases or {}
+    include = {item.upper() for item in (acronym_include or set()) if item.strip()}
+    exclude = {item.upper() for item in (acronym_exclude or set()) if item.strip()}
     blocks: list[str] = []
     for paragraph in paragraphs:
-        escaped = html.escape(paragraph, quote=False)
-        escaped = re.sub(r"([.!?…])\s+", r'\1<break time="350ms"/> ', escaped)
-        escaped = re.sub(r"([;:])\s+", r'\1<break time="220ms"/> ', escaped)
+        rendered = render_ssml_paragraph(
+            paragraph,
+            pronunciation_aliases=aliases,
+            pronunciation_case_sensitive=pronunciation_case_sensitive,
+            acronym_mode=acronym_mode,
+            acronym_min_len=acronym_min_len,
+            acronym_max_len=acronym_max_len,
+            acronym_include=include,
+            acronym_exclude=exclude,
+        )
         if is_chapter_heading(paragraph):
-            blocks.append(f"<p><emphasis level=\"moderate\">{escaped}</emphasis><break time=\"900ms\"/></p>")
+            blocks.append(f"<p><emphasis level=\"moderate\">{rendered}</emphasis><break time=\"900ms\"/></p>")
         else:
-            blocks.append(f"<p>{escaped}</p>")
+            blocks.append(f"<p>{rendered}</p>")
     return "<speak>" + "".join(blocks) + "</speak>"
 
 
@@ -1205,16 +1629,92 @@ def run_tts(
     test_delay: float = 0.02,
     test_write_placeholders: bool = False,
     use_ssml: bool = True,
+    pronunciation_file: Path | None = None,
+    pronunciation_aliases: dict[str, str] | None = None,
+    pronunciation_case_sensitive: bool = False,
+    acronym_mode: str = "auto",
+    acronym_min_len: int = 2,
+    acronym_max_len: int = 5,
+    acronym_include: list[str] | None = None,
+    acronym_exclude: list[str] | None = None,
     write_chapter_map: Path | None = None,
     max_chars_per_run: int | None = None,
     max_cost_usd: float | None = None,
     confirm_before_spend: bool = False,
     dashboard: bool = True,
+    workers: int = 1,
+    rate_limit_rps: float | None = None,
+    retry_attempts: int = RETRY_ATTEMPTS,
+    retry_base_delay_s: float = 1.0,
+    retry_backoff_factor: float = 1.8,
+    retry_max_delay_s: float = 30.0,
+    retry_jitter_s: float = 0.25,
+    retry_failed_chunks: bool = True,
+    chunk_cache: bool = True,
+    cache_dir: Path | None = None,
 ) -> dict[str, int | float | str | bool]:
+    run_started_at = time.perf_counter()
     if not input_txt.exists():
         raise RuntimeError(f"Missing {input_txt}. Provide a valid text file.")
+    if workers < 1:
+        raise RuntimeError("--workers must be >= 1")
+    if retry_attempts < 1:
+        raise RuntimeError("--retry-attempts must be >= 1")
+    if retry_base_delay_s < 0:
+        raise RuntimeError("--retry-base-delay must be >= 0")
+    if retry_backoff_factor < 1.0:
+        raise RuntimeError("--retry-backoff-factor must be >= 1")
+    if retry_max_delay_s < 0:
+        raise RuntimeError("--retry-max-delay must be >= 0")
+    if retry_jitter_s < 0:
+        raise RuntimeError("--retry-jitter must be >= 0")
+    if rate_limit_rps is not None and rate_limit_rps <= 0:
+        raise RuntimeError("--rate-limit-rps must be > 0")
+    if retry_failed_chunks not in {True, False}:
+        raise RuntimeError("--retry-failed-chunks must be a boolean value")
+    if acronym_mode not in {"off", "auto", "list"}:
+        raise RuntimeError("--acronym-mode must be one of: off, auto, list")
+    if acronym_min_len < 1:
+        raise RuntimeError("--acronym-min-len must be >= 1")
+    if acronym_max_len < acronym_min_len:
+        raise RuntimeError("--acronym-max-len must be >= --acronym-min-len")
 
     out_dir.mkdir(exist_ok=True, parents=True)
+    if cache_dir is None:
+        cache_dir = out_dir / ".chunk_cache"
+    if chunk_cache:
+        cache_dir.mkdir(exist_ok=True, parents=True)
+
+    retry_policy = RetryPolicy(
+        attempts=retry_attempts,
+        base_delay_s=retry_base_delay_s,
+        backoff_factor=retry_backoff_factor,
+        max_delay_s=retry_max_delay_s,
+        jitter_s=retry_jitter_s,
+    )
+
+    effective_aliases: dict[str, str] = {}
+    if pronunciation_file is not None:
+        effective_aliases.update(load_pronunciation_aliases_file(pronunciation_file))
+    if pronunciation_aliases:
+        effective_aliases.update(normalize_aliases_map(pronunciation_aliases))
+    acronym_include_set = {item.strip().upper() for item in (acronym_include or []) if item.strip()}
+    acronym_exclude_set = {item.strip().upper() for item in (acronym_exclude or []) if item.strip()}
+    ssml_profile_signature = json.dumps(
+        {
+            "use_ssml": bool(use_ssml),
+            "pronunciation_case_sensitive": bool(pronunciation_case_sensitive),
+            "aliases": effective_aliases,
+            "acronym_mode": acronym_mode,
+            "acronym_min_len": int(acronym_min_len),
+            "acronym_max_len": int(acronym_max_len),
+            "acronym_include": sorted(acronym_include_set),
+            "acronym_exclude": sorted(acronym_exclude_set),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
     raw = input_txt.read_text(errors="ignore")
     text = clean_text(raw)
@@ -1249,13 +1749,37 @@ def run_tts(
     print(f"Chunks to synthesize: {len(chunks):,}")
     print(f"Detected chapters: {len(chapter_ranges)}")
     print(f"Output folder: {out_dir.resolve()}")
+    if use_ssml:
+        print(
+            f"SSML profile: aliases={len(effective_aliases)}, "
+            f"acronym_mode={acronym_mode}, acronym_len={acronym_min_len}-{acronym_max_len}"
+        )
 
     preview = build_billing_preview(
         voice_name=voice_name,
         chunks=chunks,
         out_dir=out_dir,
     )
+    cache_plan = plan_chunk_cache(
+        chunks=chunks,
+        out_dir=out_dir,
+        cache_dir=cache_dir,
+        enabled=chunk_cache,
+        lang=lang,
+        voice_name=voice_name,
+        speaking_rate=speaking_rate,
+        pitch=pitch,
+        use_ssml=use_ssml,
+        ssml_profile_signature=ssml_profile_signature,
+    )
+    preview = adjust_preview_for_cache_candidates(preview, cache_plan)
     render_billing_preview(preview, ui_mode=ui_mode)
+    if cache_plan.enabled:
+        print(
+            f"Chunk cache: {cache_plan.cache_dir.resolve()} "
+            f"(candidates: {len(cache_plan.hit_candidates)} chunks, "
+            f"{cache_plan.hit_candidate_chars:,} chars)"
+        )
     enforce_run_limits(
         preview,
         max_chars_per_run=max_chars_per_run,
@@ -1274,12 +1798,32 @@ def run_tts(
             "estimated_pending_chars": preview.pending_chars,
             "estimated_billable_chars": preview.pending_chars,
             "estimated_cost_usd": float(preview.estimated_cost_usd or 0.0),
+            "cache_enabled": bool(chunk_cache),
+            "cache_dir": str(cache_dir),
+            "cache_hit_candidates": len(cache_plan.hit_candidates),
+            "cache_hit_candidate_chars": cache_plan.hit_candidate_chars,
+            "total_chars": len(text),
+            "voice_name": voice_name,
+            "run_duration_s": round(time.perf_counter() - run_started_at, 3),
             "chapters": len(chapter_ranges),
             "chapter_map_path": str(write_chapter_map) if write_chapter_map is not None else "",
         }
 
     if preview.pending_chars == 0:
-        print("All chunk files already exist. Nothing new to synthesize.")
+        cache_hits = 0
+        if cache_plan.enabled and cache_plan.hit_candidates:
+            for idx in sorted(cache_plan.hit_candidates):
+                out_file = out_dir / f"{idx:04d}.mp3"
+                if out_file.exists() and out_file.stat().st_size > 0:
+                    continue
+                cache_key = cache_plan.keys.get(idx)
+                if cache_key is None:
+                    continue
+                cache_file = cache_file_for_key(cache_plan.cache_dir, cache_key)
+                if restore_chunk_from_cache(cache_file, out_file):
+                    cache_hits += 1
+
+        print("All chunk files already exist or were restored from cache. Nothing new to synthesize.")
         render_billing_postrun(
             preview=preview,
             generated_chars=0,
@@ -1289,6 +1833,7 @@ def run_tts(
         )
         return {
             "estimate_only": False,
+            "test_run": False,
             "generated": 0,
             "skipped": len(chunks),
             "failures": 0,
@@ -1296,6 +1841,14 @@ def run_tts(
             "generated_chars": 0,
             "run_billable_chars": 0,
             "run_estimated_cost_usd": 0.0,
+            "cache_enabled": bool(chunk_cache),
+            "cache_dir": str(cache_dir),
+            "cache_hits": cache_hits,
+            "cache_writes": 0,
+            "workers": workers,
+            "total_chars": len(text),
+            "voice_name": voice_name,
+            "run_duration_s": round(time.perf_counter() - run_started_at, 3),
             "chapters": len(chapter_ranges),
             "chapter_map_path": str(write_chapter_map) if write_chapter_map is not None else "",
         }
@@ -1311,6 +1864,7 @@ def run_tts(
         skipped = 0
         generated_chars = 0
         failures = 0
+        cache_hits = 0
 
         use_rich = should_use_rich_ui(ui_mode)
         dashboard_enabled = use_rich and dashboard and sys.stdin.isatty() and sys.stdout.isatty()
@@ -1397,6 +1951,12 @@ def run_tts(
                             progress.advance(task)
                             events.append(f"Skipped {out_file.name} (already exists).")
                             continue
+                        if cache_plan.enabled and idx in cache_plan.hit_candidates:
+                            skipped += 1
+                            cache_hits += 1
+                            progress.advance(task)
+                            events.append(f"Skipped {out_file.name} (cache candidate).")
+                            continue
 
                         if test_delay > 0:
                             time.sleep(test_delay)
@@ -1445,6 +2005,11 @@ def run_tts(
                         skipped += 1
                         progress.advance(task)
                         continue
+                    if cache_plan.enabled and idx in cache_plan.hit_candidates:
+                        skipped += 1
+                        cache_hits += 1
+                        progress.advance(task)
+                        continue
 
                     if test_delay > 0:
                         time.sleep(test_delay)
@@ -1458,6 +2023,10 @@ def run_tts(
                 out_file = out_dir / f"{idx:04d}.mp3"
                 if out_file.exists() and out_file.stat().st_size > 0:
                     skipped += 1
+                    continue
+                if cache_plan.enabled and idx in cache_plan.hit_candidates:
+                    skipped += 1
+                    cache_hits += 1
                     continue
 
                 if test_delay > 0:
@@ -1493,12 +2062,20 @@ def run_tts(
             "generated_chars": generated_chars,
             "run_billable_chars": generated_chars,
             "run_estimated_cost_usd": float(run_estimated_cost_usd or 0.0),
+            "cache_enabled": bool(chunk_cache),
+            "cache_dir": str(cache_dir),
+            "cache_hits": cache_hits,
+            "cache_writes": 0,
+            "workers": workers,
+            "total_chars": len(text),
+            "voice_name": voice_name,
+            "run_duration_s": round(time.perf_counter() - run_started_at, 3),
             "chapters": len(chapter_ranges),
             "chapter_map_path": str(write_chapter_map) if write_chapter_map is not None else "",
         }
 
     texttospeech = load_google_tts()
-    client = texttospeech.TextToSpeechClient()
+    base_client = texttospeech.TextToSpeechClient()
 
     voice = texttospeech.VoiceSelectionParams(
         language_code=lang,
@@ -1511,283 +2088,367 @@ def run_tts(
         pitch=pitch,
     )
 
+    rate_limiter = RateLimiter(rate_limit_rps)
     failures: list[tuple[str, str]] = []
     failed_indices: list[int] = []
     generated = 0
     skipped = 0
+    cache_hits = 0
+    cache_writes = 0
     generated_chars = 0
+
+    def synthesize_index(idx: int, *, client_obj: Any) -> bytes:
+        return synthesize_with_adaptive_split(
+            client_obj,
+            texttospeech,
+            chunks[idx],
+            voice,
+            audio_config,
+            use_ssml=use_ssml,
+            pronunciation_aliases=effective_aliases,
+            pronunciation_case_sensitive=pronunciation_case_sensitive,
+            acronym_mode=acronym_mode,
+            acronym_min_len=acronym_min_len,
+            acronym_max_len=acronym_max_len,
+            acronym_include=acronym_include_set,
+            acronym_exclude=acronym_exclude_set,
+            retry_policy=retry_policy,
+            rate_limiter=rate_limiter,
+            depth=0,
+        )
+
+    def write_chunk_audio(idx: int, audio: bytes) -> None:
+        nonlocal cache_writes
+        out_file = out_dir / f"{idx:04d}.mp3"
+        tmp_file = out_file.with_suffix(".mp3.tmp")
+        tmp_file.write_bytes(audio)
+        tmp_file.replace(out_file)
+        if cache_plan.enabled:
+            cache_key = cache_plan.keys.get(idx)
+            if cache_key is not None:
+                cache_file = cache_file_for_key(cache_plan.cache_dir, cache_key)
+                if persist_chunk_to_cache(cache_file, audio):
+                    cache_writes += 1
+
+    pending_indices: list[int] = []
+    for idx in range(len(chunks)):
+        out_file = out_dir / f"{idx:04d}.mp3"
+        if out_file.exists() and out_file.stat().st_size > 0:
+            skipped += 1
+            continue
+
+        restored = False
+        if cache_plan.enabled and idx in cache_plan.hit_candidates:
+            cache_key = cache_plan.keys.get(idx)
+            if cache_key is not None:
+                cache_file = cache_file_for_key(cache_plan.cache_dir, cache_key)
+                restored = restore_chunk_from_cache(cache_file, out_file)
+
+        if restored:
+            skipped += 1
+            cache_hits += 1
+            continue
+
+        pending_indices.append(idx)
 
     use_rich = should_use_rich_ui(ui_mode)
     dashboard_enabled = use_rich and dashboard and sys.stdin.isatty() and sys.stdout.isatty()
+    effective_workers = workers
+    if dashboard_enabled and workers > 1:
+        print("Dashboard mode currently runs sequentially. Use --no-dashboard for parallel workers.")
+        effective_workers = 1
 
-    if dashboard_enabled:
-        from rich.live import Live
-        from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeRemainingColumn
+    print(
+        f"Synthesis settings: workers={effective_workers}, "
+        f"rate_limit_rps={rate_limit_rps if rate_limit_rps is not None else 'none'}, "
+        f"retry_attempts={retry_policy.attempts}"
+    )
 
-        progress = Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeRemainingColumn(),
-        )
-        task = progress.add_task("Synthesizing", total=len(chunks))
+    if pending_indices:
+        if dashboard_enabled:
+            from rich.live import Live
+            from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeRemainingColumn
 
-        paused = False
-        retry_requested = False
-        cancelled = False
-        current_chunk = "-"
-        events: list[str] = []
+            progress = Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeRemainingColumn(),
+            )
+            task = progress.add_task("Synthesizing", total=len(pending_indices))
 
-        def handle_keys() -> None:
-            nonlocal paused, retry_requested, cancelled
-            while True:
-                key = poll_dashboard_key()
-                if key is None:
-                    return
-                key = key.lower()
-                if key == "p":
-                    paused = not paused
-                    events.append("Paused." if paused else "Resumed.")
-                elif key == "r":
-                    retry_requested = True
-                    events.append("Retry flag enabled for failed chunks.")
-                elif key == "q":
-                    cancelled = True
-                    events.append("Cancel requested.")
+            paused = False
+            retry_requested = False
+            cancelled = False
+            current_chunk = "-"
+            events: list[str] = []
 
-        with dashboard_keyboard_mode(True):
-            with Live(
-                build_dashboard_view(
-                    preview=preview,
-                    progress=progress,
-                    generated=generated,
-                    skipped=skipped,
-                    failures=len(failures),
-                    generated_chars=generated_chars,
-                    paused=paused,
-                    retry_requested=retry_requested,
-                    cancelled=cancelled,
-                    current_chunk=current_chunk,
-                    events=events,
-                ),
-                refresh_per_second=8,
-            ) as live:
-                for idx, chunk in enumerate(chunks):
-                    handle_keys()
-                    while paused and not cancelled:
-                        handle_keys()
-                        live.update(
-                            build_dashboard_view(
-                                preview=preview,
-                                progress=progress,
-                                generated=generated,
-                                skipped=skipped,
-                                failures=len(failures),
-                                generated_chars=generated_chars,
-                                paused=paused,
-                                retry_requested=retry_requested,
-                                cancelled=cancelled,
-                                current_chunk=current_chunk,
-                                events=events,
-                            )
-                        )
-                        time.sleep(0.1)
+            def handle_keys() -> None:
+                nonlocal paused, retry_requested, cancelled
+                while True:
+                    key = poll_dashboard_key()
+                    if key is None:
+                        return
+                    key = key.lower()
+                    if key == "p":
+                        paused = not paused
+                        events.append("Paused." if paused else "Resumed.")
+                    elif key == "r":
+                        retry_requested = True
+                        events.append("Retry flag enabled for failed chunks.")
+                    elif key == "q":
+                        cancelled = True
+                        events.append("Cancel requested.")
 
-                    if cancelled:
-                        raise RuntimeError("Cancelled from dashboard.")
-
-                    stem = f"{idx:04d}"
-                    current_chunk = f"{idx + 1}/{len(chunks)}"
-                    out_file = out_dir / f"{stem}.mp3"
-                    if out_file.exists() and out_file.stat().st_size > 0:
-                        skipped += 1
-                        progress.advance(task)
-                        events.append(f"Skipped {stem}.mp3 (already exists).")
-                        continue
-
-                    try:
-                        audio = synthesize_with_adaptive_split(
-                            client,
-                            texttospeech,
-                            chunk,
-                            voice,
-                            audio_config,
-                            use_ssml=use_ssml,
-                            depth=0,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        failures.append((stem, str(exc)))
-                        failed_indices.append(idx)
-                        events.append(f"Failed {stem}: {exc}")
-                        progress.advance(task)
-                        live.update(
-                            build_dashboard_view(
-                                preview=preview,
-                                progress=progress,
-                                generated=generated,
-                                skipped=skipped,
-                                failures=len(failures),
-                                generated_chars=generated_chars,
-                                paused=paused,
-                                retry_requested=retry_requested,
-                                cancelled=cancelled,
-                                current_chunk=current_chunk,
-                                events=events,
-                            )
-                        )
-                        continue
-
-                    tmp_file = out_file.with_suffix(".mp3.tmp")
-                    tmp_file.write_bytes(audio)
-                    tmp_file.replace(out_file)
-                    generated += 1
-                    generated_chars += len(chunk)
-                    progress.advance(task)
-                    if generated % 25 == 0:
-                        events.append(f"Generated {generated}/{len(chunks)} chunks.")
-
-                    live.update(
-                        build_dashboard_view(
-                            preview=preview,
-                            progress=progress,
-                            generated=generated,
-                            skipped=skipped,
-                            failures=len(failures),
-                            generated_chars=generated_chars,
-                            paused=paused,
-                            retry_requested=retry_requested,
-                            cancelled=cancelled,
-                            current_chunk=current_chunk,
-                            events=events,
-                        )
-                    )
-
-                if retry_requested and failed_indices:
-                    retry_task = progress.add_task("Retry failed", total=len(failed_indices))
-                    for idx in list(failed_indices):
+            with dashboard_keyboard_mode(True):
+                with Live(
+                    build_dashboard_view(
+                        preview=preview,
+                        progress=progress,
+                        generated=generated,
+                        skipped=skipped,
+                        failures=len(failures),
+                        generated_chars=generated_chars,
+                        paused=paused,
+                        retry_requested=retry_requested,
+                        cancelled=cancelled,
+                        current_chunk=current_chunk,
+                        events=events,
+                    ),
+                    refresh_per_second=8,
+                ) as live:
+                    for pos, idx in enumerate(pending_indices, start=1):
                         handle_keys()
                         while paused and not cancelled:
                             handle_keys()
+                            live.update(
+                                build_dashboard_view(
+                                    preview=preview,
+                                    progress=progress,
+                                    generated=generated,
+                                    skipped=skipped,
+                                    failures=len(failures),
+                                    generated_chars=generated_chars,
+                                    paused=paused,
+                                    retry_requested=retry_requested,
+                                    cancelled=cancelled,
+                                    current_chunk=current_chunk,
+                                    events=events,
+                                )
+                            )
                             time.sleep(0.1)
+
                         if cancelled:
                             raise RuntimeError("Cancelled from dashboard.")
 
                         stem = f"{idx:04d}"
-                        out_file = out_dir / f"{stem}.mp3"
-                        if out_file.exists() and out_file.stat().st_size > 0:
-                            progress.advance(retry_task)
-                            continue
-
+                        current_chunk = f"{pos}/{len(pending_indices)}"
                         try:
-                            audio = synthesize_with_adaptive_split(
-                                client,
-                                texttospeech,
-                                chunks[idx],
-                                voice,
-                                audio_config,
-                                use_ssml=use_ssml,
-                                depth=0,
-                            )
+                            audio = synthesize_index(idx, client_obj=base_client)
                         except Exception as exc:  # noqa: BLE001
-                            for pos, (failed_stem, _) in enumerate(failures):
-                                if failed_stem == stem:
-                                    failures[pos] = (failed_stem, str(exc))
-                                    break
-                            progress.advance(retry_task)
-                            events.append(f"Retry failed {stem}: {exc}")
+                            failures.append((stem, str(exc)))
+                            failed_indices.append(idx)
+                            events.append(f"Failed {stem}: {exc}")
+                            progress.advance(task)
                             continue
 
-                        tmp_file = out_file.with_suffix(".mp3.tmp")
-                        tmp_file.write_bytes(audio)
-                        tmp_file.replace(out_file)
+                        write_chunk_audio(idx, audio)
                         generated += 1
                         generated_chars += len(chunks[idx])
-                        failures = [item for item in failures if item[0] != stem]
-                        progress.advance(retry_task)
-                        events.append(f"Retry succeeded {stem}.")
+                        progress.advance(task)
+                        if generated % 25 == 0:
+                            events.append(f"Generated {generated}/{len(pending_indices)} chunks.")
 
-    elif use_rich:
-        from rich.progress import (
-            BarColumn,
-            MofNCompleteColumn,
-            Progress,
-            TextColumn,
-            TimeRemainingColumn,
-        )
+                        live.update(
+                            build_dashboard_view(
+                                preview=preview,
+                                progress=progress,
+                                generated=generated,
+                                skipped=skipped,
+                                failures=len(failures),
+                                generated_chars=generated_chars,
+                                paused=paused,
+                                retry_requested=retry_requested,
+                                cancelled=cancelled,
+                                current_chunk=current_chunk,
+                                events=events,
+                            )
+                        )
 
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeRemainingColumn(),
-        ) as progress:
-            task = progress.add_task("Synthesizing", total=len(chunks))
+                    if retry_requested and failed_indices:
+                        retry_task = progress.add_task("Retry failed", total=len(failed_indices))
+                        for idx in list(failed_indices):
+                            handle_keys()
+                            while paused and not cancelled:
+                                handle_keys()
+                                time.sleep(0.1)
+                            if cancelled:
+                                raise RuntimeError("Cancelled from dashboard.")
 
-            for idx, chunk in enumerate(chunks):
-                stem = f"{idx:04d}"
-                out_file = out_dir / f"{stem}.mp3"
-                if out_file.exists() and out_file.stat().st_size > 0:
-                    skipped += 1
+                            stem = f"{idx:04d}"
+                            out_file = out_dir / f"{stem}.mp3"
+                            if out_file.exists() and out_file.stat().st_size > 0:
+                                progress.advance(retry_task)
+                                continue
+
+                            try:
+                                audio = synthesize_index(idx, client_obj=base_client)
+                            except Exception as exc:  # noqa: BLE001
+                                for pos, (failed_stem, _) in enumerate(failures):
+                                    if failed_stem == stem:
+                                        failures[pos] = (failed_stem, str(exc))
+                                        break
+                                progress.advance(retry_task)
+                                events.append(f"Retry failed {stem}: {exc}")
+                                continue
+
+                            write_chunk_audio(idx, audio)
+                            generated += 1
+                            generated_chars += len(chunks[idx])
+                            failures = [item for item in failures if item[0] != stem]
+                            progress.advance(retry_task)
+                            events.append(f"Retry succeeded {stem}.")
+
+        elif effective_workers > 1:
+            thread_state = threading.local()
+
+            def worker(task_idx: int) -> tuple[int, bytes]:
+                client_obj = getattr(thread_state, "client", None)
+                if client_obj is None:
+                    client_obj = texttospeech.TextToSpeechClient()
+                    thread_state.client = client_obj
+                return task_idx, synthesize_index(task_idx, client_obj=client_obj)
+
+            if use_rich:
+                from rich.progress import (
+                    BarColumn,
+                    MofNCompleteColumn,
+                    Progress,
+                    TextColumn,
+                    TimeRemainingColumn,
+                )
+
+                with Progress(
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    MofNCompleteColumn(),
+                    TimeRemainingColumn(),
+                ) as progress:
+                    task = progress.add_task("Synthesizing", total=len(pending_indices))
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as pool:
+                        future_map = {pool.submit(worker, idx): idx for idx in pending_indices}
+                        for future in concurrent.futures.as_completed(future_map):
+                            idx = future_map[future]
+                            stem = f"{idx:04d}"
+                            try:
+                                _, audio = future.result()
+                            except Exception as exc:  # noqa: BLE001
+                                failures.append((stem, str(exc)))
+                                failed_indices.append(idx)
+                                progress.console.log(f"Failed {stem}: {exc}")
+                                progress.advance(task)
+                                continue
+                            write_chunk_audio(idx, audio)
+                            generated += 1
+                            generated_chars += len(chunks[idx])
+                            progress.advance(task)
+            else:
+                completed = 0
+                with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as pool:
+                    future_map = {pool.submit(worker, idx): idx for idx in pending_indices}
+                    for future in concurrent.futures.as_completed(future_map):
+                        idx = future_map[future]
+                        stem = f"{idx:04d}"
+                        completed += 1
+                        try:
+                            _, audio = future.result()
+                        except Exception as exc:  # noqa: BLE001
+                            failures.append((stem, str(exc)))
+                            failed_indices.append(idx)
+                            print(f"Failed {stem}: {exc}")
+                            continue
+                        write_chunk_audio(idx, audio)
+                        generated += 1
+                        generated_chars += len(chunks[idx])
+                        if completed % 25 == 0:
+                            print(f"Processed {completed}/{len(pending_indices)} chunks.")
+        elif use_rich:
+            from rich.progress import (
+                BarColumn,
+                MofNCompleteColumn,
+                Progress,
+                TextColumn,
+                TimeRemainingColumn,
+            )
+
+            with Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeRemainingColumn(),
+            ) as progress:
+                task = progress.add_task("Synthesizing", total=len(pending_indices))
+                for idx in pending_indices:
+                    stem = f"{idx:04d}"
+                    try:
+                        audio = synthesize_index(idx, client_obj=base_client)
+                    except Exception as exc:  # noqa: BLE001
+                        failures.append((stem, str(exc)))
+                        failed_indices.append(idx)
+                        progress.console.log(f"Failed {stem}: {exc}")
+                        progress.advance(task)
+                        continue
+                    write_chunk_audio(idx, audio)
+                    generated += 1
+                    generated_chars += len(chunks[idx])
                     progress.advance(task)
-                    continue
-
+        else:
+            for pos, idx in enumerate(pending_indices, start=1):
+                stem = f"{idx:04d}"
                 try:
-                    audio = synthesize_with_adaptive_split(
-                        client,
-                        texttospeech,
-                        chunk,
-                        voice,
-                        audio_config,
-                        use_ssml=use_ssml,
-                        depth=0,
-                    )
+                    audio = synthesize_index(idx, client_obj=base_client)
                 except Exception as exc:  # noqa: BLE001
                     failures.append((stem, str(exc)))
                     failed_indices.append(idx)
-                    progress.console.log(f"Failed {stem}: {exc}")
-                    progress.advance(task)
+                    print(f"Failed {stem}: {exc}")
                     continue
 
-                tmp_file = out_file.with_suffix(".mp3.tmp")
-                tmp_file.write_bytes(audio)
-                tmp_file.replace(out_file)
+                write_chunk_audio(idx, audio)
                 generated += 1
-                generated_chars += len(chunk)
-                progress.advance(task)
-    else:
-        for idx, chunk in enumerate(chunks):
-            stem = f"{idx:04d}"
-            out_file = out_dir / f"{stem}.mp3"
-            if out_file.exists() and out_file.stat().st_size > 0:
-                skipped += 1
-                continue
+                generated_chars += len(chunks[idx])
+                if pos % 25 == 0:
+                    print(f"Generated {pos}/{len(pending_indices)} files. Last: {stem}.mp3")
 
-            try:
-                audio = synthesize_with_adaptive_split(
-                    client,
-                    texttospeech,
-                    chunk,
-                    voice,
-                    audio_config,
-                    use_ssml=use_ssml,
-                    depth=0,
-                )
-            except Exception as exc:  # noqa: BLE001
-                failures.append((stem, str(exc)))
-                failed_indices.append(idx)
-                print(f"Failed {stem}: {exc}")
-                continue
+    if retry_failed_chunks and failures:
+        retry_candidates = sorted(
+            {
+                int(stem)
+                for stem, _ in failures
+                if stem.isdigit()
+            }
+        )
+        if retry_candidates:
+            print(f"Retrying failed chunks once: {len(retry_candidates)}")
+            remaining_failures: list[tuple[str, str]] = []
+            for idx in retry_candidates:
+                stem = f"{idx:04d}"
+                out_file = out_dir / f"{stem}.mp3"
+                if out_file.exists() and out_file.stat().st_size > 0:
+                    continue
+                try:
+                    audio = synthesize_index(idx, client_obj=base_client)
+                except Exception as exc:  # noqa: BLE001
+                    remaining_failures.append((stem, str(exc)))
+                    continue
+                write_chunk_audio(idx, audio)
+                generated += 1
+                generated_chars += len(chunks[idx])
+            failures = remaining_failures
 
-            tmp_file = out_file.with_suffix(".mp3.tmp")
-            tmp_file.write_bytes(audio)
-            tmp_file.replace(out_file)
-            generated += 1
-            generated_chars += len(chunk)
-
-            if generated % 25 == 0:
-                print(f"Generated {generated}/{len(chunks)} files. Last: {out_file.name}")
-
-    print(f"Done. Generated: {generated}, skipped: {skipped}, failures: {len(failures)}.")
+    print(
+        f"Done. Generated: {generated}, skipped: {skipped}, failures: {len(failures)}, "
+        f"cache hits: {cache_hits}, cache writes: {cache_writes}."
+    )
 
     run_billable_chars = generated_chars
 
@@ -1819,6 +2480,14 @@ def run_tts(
         "generated_chars": generated_chars,
         "run_billable_chars": int(run_billable_chars or 0),
         "run_estimated_cost_usd": float(run_estimated_cost_usd or 0.0),
+        "cache_enabled": bool(chunk_cache),
+        "cache_dir": str(cache_dir),
+        "cache_hits": cache_hits,
+        "cache_writes": cache_writes,
+        "workers": effective_workers,
+        "total_chars": len(text),
+        "voice_name": voice_name,
+        "run_duration_s": round(time.perf_counter() - run_started_at, 3),
         "chapters": len(chapter_ranges),
         "chapter_map_path": str(write_chapter_map) if write_chapter_map is not None else "",
     }
@@ -1826,6 +2495,11 @@ def run_tts(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate MP3 chunks from a text file.")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {get_version()}",
+    )
     parser.add_argument(
         "--deps-file",
         type=Path,
@@ -1924,10 +2598,110 @@ def build_parser() -> argparse.ArgumentParser:
         help="Shape chunk text into SSML before synthesis",
     )
     parser.add_argument(
+        "--pronunciation-file",
+        type=Path,
+        default=None,
+        help="Path to pronunciation dictionary (.toml/.json or key=value text)",
+    )
+    parser.add_argument(
+        "--pronunciation-case-sensitive",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Treat pronunciation dictionary keys as case-sensitive",
+    )
+    parser.add_argument(
+        "--acronym-mode",
+        choices=("off", "auto", "list"),
+        default="auto",
+        help="Acronym SSML behavior: off, auto, or list-only",
+    )
+    parser.add_argument(
+        "--acronym-min-len",
+        type=int,
+        default=2,
+        help="Minimum acronym length for auto mode",
+    )
+    parser.add_argument(
+        "--acronym-max-len",
+        type=int,
+        default=5,
+        help="Maximum acronym length for auto mode",
+    )
+    parser.add_argument(
+        "--acronym-include",
+        default="",
+        help="Comma-separated acronyms to force spell-out (works with auto/list)",
+    )
+    parser.add_argument(
+        "--acronym-exclude",
+        default="",
+        help="Comma-separated acronyms to never spell-out",
+    )
+    parser.add_argument(
         "--dashboard",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable full-screen rich dashboard with pause/resume controls",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel synthesis workers (dashboard mode stays sequential)",
+    )
+    parser.add_argument(
+        "--rate-limit-rps",
+        type=float,
+        default=None,
+        help="Max API request starts per second across workers",
+    )
+    parser.add_argument(
+        "--retry-attempts",
+        type=int,
+        default=RETRY_ATTEMPTS,
+        help="Retry attempts per API call",
+    )
+    parser.add_argument(
+        "--retry-base-delay",
+        type=float,
+        default=1.0,
+        help="Initial retry backoff delay in seconds",
+    )
+    parser.add_argument(
+        "--retry-backoff-factor",
+        type=float,
+        default=1.8,
+        help="Exponential multiplier for retry delay",
+    )
+    parser.add_argument(
+        "--retry-max-delay",
+        type=float,
+        default=30.0,
+        help="Cap for retry delay in seconds",
+    )
+    parser.add_argument(
+        "--retry-jitter",
+        type=float,
+        default=0.25,
+        help="Random jitter added to each retry delay in seconds",
+    )
+    parser.add_argument(
+        "--retry-failed-chunks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Retry failed chunks once after the main synthesis pass",
+    )
+    parser.add_argument(
+        "--chunk-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable reusable chunk audio cache",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="Directory for reusable chunk cache (default: <output-dir>/.chunk_cache)",
     )
     parser.add_argument(
         "--max-cost-usd",
@@ -1980,11 +2754,28 @@ def main() -> None:
             test_delay=args.test_delay,
             test_write_placeholders=args.test_write_placeholders,
             use_ssml=bool(args.use_ssml),
+            pronunciation_file=args.pronunciation_file,
+            pronunciation_case_sensitive=bool(args.pronunciation_case_sensitive),
+            acronym_mode=args.acronym_mode,
+            acronym_min_len=args.acronym_min_len,
+            acronym_max_len=args.acronym_max_len,
+            acronym_include=parse_csv_items(args.acronym_include),
+            acronym_exclude=parse_csv_items(args.acronym_exclude),
             write_chapter_map=args.write_chapter_map,
             max_chars_per_run=args.max_chars_per_run,
             max_cost_usd=args.max_cost_usd,
             confirm_before_spend=bool(args.confirm_before_spend),
             dashboard=bool(args.dashboard),
+            workers=args.workers,
+            rate_limit_rps=args.rate_limit_rps,
+            retry_attempts=args.retry_attempts,
+            retry_base_delay_s=args.retry_base_delay,
+            retry_backoff_factor=args.retry_backoff_factor,
+            retry_max_delay_s=args.retry_max_delay,
+            retry_jitter_s=args.retry_jitter,
+            retry_failed_chunks=bool(args.retry_failed_chunks),
+            chunk_cache=bool(args.chunk_cache),
+            cache_dir=args.cache_dir,
         )
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from exc

@@ -1,0 +1,17 @@
+{
+  "chunk_count": 2,
+  "chapters": [
+    {
+      "chapter_index": 0,
+      "title": "CHAPTER 1",
+      "start_chunk": 0,
+      "end_chunk": 0
+    },
+    {
+      "chapter_index": 1,
+      "title": "CHAPTER 2",
+      "start_chunk": 1,
+      "end_chunk": 1
+    }
+  ]
+}

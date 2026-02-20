@@ -30,3 +30,6 @@ book.txt
 *.bak
 *.pre_tts.bak
 *.pdf
+
+# Packaging artifacts
+*.egg-info/

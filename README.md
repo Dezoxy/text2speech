@@ -2,6 +2,13 @@
 
 Automate book conversion from PDF/TXT to audiobook MP3 using Google Cloud Text-to-Speech.
 
+## Start Here
+
+- Fast setup: read `docs/QUICKSTART.md`.
+- New to the project: read `docs/PROJECT_BOOK.md` (step-by-step handbook).
+- Hungarian handbook: read `docs/PROJECT_BOOK.hu.md`.
+- Need commands quickly: use `docs/COMMANDS.md` (explained command reference).
+
 ## Folder Layout
 
 - `input/`: source files (`.pdf` or `.txt`)
@@ -14,15 +21,20 @@ Defaults are loaded from `config.toml`.
 
 Main sections:
 
-- `[paths]`: `input`, `work_dir`, `out_dir`
-- `[pipeline]`: `ocr`, `ocr_lang`, `ocr_page_min_chars`, `ocr_page_min_alpha_ratio`, `ocr_page_max_replacement_ratio`, `ocr_page_min_score`, `ocr_auto_bad_page_ratio`, `lang`, `voice_name`, `max_chars`, `speaking_rate`, `pitch`, `ui`, `use_ssml`, `cleanup_diff_preview`, `cleanup_diff_max_lines`, `dashboard`, `export_m4b`
+- `[paths]`: `input`, `work_dir`, `out_dir`, `cache_dir`
+- `[pipeline]`: `voice_profile`, `ocr`, `ocr_lang`, `ocr_page_min_chars`, `ocr_page_min_alpha_ratio`, `ocr_page_max_replacement_ratio`, `ocr_page_min_score`, `ocr_auto_bad_page_ratio`, `lang`, `voice_name`, `max_chars`, `speaking_rate`, `pitch`, `ui`, `use_ssml`, `cleanup_diff_preview`, `cleanup_diff_max_lines`, `dashboard`, `export_m4b`, `chunk_cache`, `workers`, `rate_limit_rps`, `retry_failed_chunks`, `retry_failed_jobs`
+- `[voice_profiles]`: presets like `academic`, `novel`, `scan-heavy`
+- `[pronunciation]`: dictionary aliases for names/terms
+- `[ssml_rules]`: acronym spell-out behavior (`off|auto|list`)
+- `[export]`: `.m4b` metadata (`book_title`, `book_author`, `cover_image`, chapter title cleanup)
+- `[retry]`: `attempts`, `base_delay`, `backoff_factor`, `max_delay`, `jitter`
 - `[limits]`: `max_chars_per_run`, `max_cost_usd`, `confirm_before_spend`
 - `[flags]`: default booleans for skip/test/estimate modes
 
 Use another config file:
 
 ```bash
-python3 pipeline.py --config /path/to/config.toml
+t2s --config /path/to/config.toml
 ```
 
 CLI args always override config values.
@@ -32,7 +44,10 @@ CLI args always override config values.
 - `pipeline.py`: End-to-end flow (`input -> OCR/extract -> cleanup -> TTS -> out/*.mp3`).
 - `make_mp3.py`: Direct TTS chunk generator for already prepared `.txt` files.
 - `dependencies.toml`: dependency manifest used by startup precheck/installer.
-- `docs/COMMANDS.md`: command cheat sheet.
+- `docs/QUICKSTART.md`: one-page quick start.
+- `docs/PROJECT_BOOK.md`: beginner-friendly walkthrough.
+- `docs/PROJECT_BOOK.hu.md`: Hungarian handbook.
+- `docs/COMMANDS.md`: detailed command guide with what/when/expected-result notes.
 
 ## System Requirements
 
@@ -44,6 +59,31 @@ Install Python packages:
 
 ```bash
 pip install google-cloud-texttospeech rich
+```
+
+## Installable CLI
+
+Install the project as a CLI app (recommended):
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install .
+```
+
+Then use:
+
+```bash
+t2s --help
+t2s --version
+t2s-make --help
+```
+
+Direct script mode is still supported:
+
+```bash
+python3 pipeline.py --help
+python3 make_mp3.py --help
 ```
 
 Install local command-line tools used by the pipeline:
@@ -64,7 +104,7 @@ brew install poppler ocrmypdf tesseract ffmpeg
 Put your books in `input/`, then run:
 
 ```bash
-python3 pipeline.py
+t2s
 ```
 
 This processes all supported files in `input/` (`.pdf`, `.txt`), stores tmp artifacts in `work/tmp/`, and writes final merged `.mp3` plus chaptered `.m4b` to `out/`.
@@ -75,6 +115,7 @@ Useful options:
 - `--work-dir work`
 - `--out-dir out`
 - `--ocr auto|always|never`
+- `--voice-profile academic|novel|scan-heavy`
 - `--ocr-lang hun+eng`
 - `--ocr-page-min-chars 30`
 - `--ocr-page-min-alpha-ratio 0.22`
@@ -89,10 +130,30 @@ Useful options:
 - `--test-delay 0.02`
 - `--test-write-placeholders` / `--no-test-write-placeholders`
 - `--use-ssml` / `--no-use-ssml`
+- `--pronunciation-file pronunciation.toml`
+- `--acronym-mode off|auto|list`
+- `--acronym-min-len 2 --acronym-max-len 5`
+- `--acronym-include API,PDF,AI`
+- `--acronym-exclude CHAPTER,FEJEZET`
 - `--cleanup-diff-preview` / `--no-cleanup-diff-preview`
 - `--cleanup-diff-max-lines 200`
 - `--dashboard` / `--no-dashboard`
+- `--chunk-cache` / `--no-chunk-cache`
+- `--cache-dir work/cache`
+- `--workers 4`
+- `--rate-limit-rps 15`
+- `--retry-attempts 6`
+- `--retry-base-delay 1.0`
+- `--retry-backoff-factor 1.8`
+- `--retry-max-delay 30`
+- `--retry-jitter 0.25`
+- `--retry-failed-chunks` / `--no-retry-failed-chunks`
+- `--retry-failed-jobs` / `--no-retry-failed-jobs`
 - `--export-m4b` / `--no-export-m4b`
+- `--book-title "Book Title"`
+- `--book-author "Author Name"`
+- `--cover-image /path/to/cover.jpg`
+- `--chapter-title-cleanup` / `--no-chapter-title-cleanup`
 - `--max-chars-per-run 2000000`
 - `--max-cost-usd 40`
 - `--confirm-before-spend` / `--no-confirm-before-spend`
@@ -104,7 +165,7 @@ Useful options:
 
 ## Dependency Precheck
 
-At startup, `pipeline.py` and `make_mp3.py` read `dependencies.toml`, check installed dependencies, and show exactly what is missing.
+At startup, `t2s` and `t2s-make` read `dependencies.toml`, check installed dependencies, and show exactly what is missing.
 
 If there are missing items and auto-install is enabled, it asks for your confirmation before installing anything.
 If required Python dependencies already exist in local `.venv`, the app auto-relaunches with `.venv/bin/python`.
@@ -118,22 +179,22 @@ Default behavior:
 Example:
 
 ```bash
-python3 pipeline.py
-python3 make_mp3.py --input /path/to/book.txt
+t2s
+t2s-make --input /path/to/book.txt
 ```
 
 Check-only mode (no installer prompt):
 
 ```bash
-python3 pipeline.py --no-deps-auto-install
-python3 make_mp3.py --input /path/to/book.txt --no-deps-auto-install
+t2s --no-deps-auto-install
+t2s-make --input /path/to/book.txt --no-deps-auto-install
 ```
 
 Skip startup dependency precheck:
 
 ```bash
-python3 pipeline.py --no-deps-check
-python3 make_mp3.py --input /path/to/book.txt --no-deps-check
+t2s --no-deps-check
+t2s-make --input /path/to/book.txt --no-deps-check
 ```
 
 ## Audio Quality + Chapters
@@ -144,7 +205,12 @@ python3 make_mp3.py --input /path/to/book.txt --no-deps-check
 - Default thresholds are tuned for mixed prose+table books to avoid unnecessary OCR on numeric pages.
 - Chapter headings are detected automatically (`Chapter`, `Fejezet`, `Part`, roman/numeric variants).
 - SSML shaping is enabled by default for better pauses and heading emphasis (`--use-ssml`).
+- Pronunciation dictionary aliases are supported (names/terms via `pronunciation.aliases` or `--pronunciation-file`).
+- Acronyms can be spoken as characters using SSML rules (`--acronym-mode`, include/exclude lists).
 - Chapter metadata is used to export chaptered `.m4b` alongside merged `.mp3`.
+- `.m4b` export supports metadata tags (title/author) and optional embedded cover art.
+
+Example external dictionary file: `pronunciation.toml.example`.
 
 Cleanup preview artifact:
 
@@ -153,13 +219,13 @@ Cleanup preview artifact:
 Disable m4b export if needed:
 
 ```bash
-python3 pipeline.py --no-export-m4b
+t2s --no-export-m4b
 ```
 
 Disable SSML shaping if needed:
 
 ```bash
-python3 pipeline.py --no-use-ssml
+t2s --no-use-ssml
 ```
 
 ## Cost + Safety Controls
@@ -167,35 +233,42 @@ python3 pipeline.py --no-use-ssml
 Hard stop by char budget:
 
 ```bash
-python3 pipeline.py --max-chars-per-run 500000
+t2s --max-chars-per-run 500000
 ```
 
 Hard stop by USD estimate:
 
 ```bash
-python3 pipeline.py --max-cost-usd 10
+t2s --max-cost-usd 10
 ```
 
 Explicit confirm gate before paid synthesis:
 
 ```bash
-python3 pipeline.py --confirm-before-spend
+t2s --confirm-before-spend
 ```
 
-The same controls are available in `make_mp3.py`.
+The same controls are available in `t2s-make`.
+
+## Performance + Reliability
+
+- Chunk cache stores synthesized chunk audio by text+voice parameters and reuses it in later runs.
+- Parallel workers (`--workers N`) can synthesize multiple chunks at once.
+- Rate limiting (`--rate-limit-rps`) and retry policy flags tune backoff behavior under API pressure.
+- Multi-job queue dashboard tracks per-job state and can retry failed jobs/chunks.
 
 ## Rich Dashboard (TUI)
 
 Use rich mode with dashboard:
 
 ```bash
-python3 pipeline.py --ui rich --dashboard
+t2s --ui rich --dashboard
 ```
 
-Dashboard keys during synthesis:
+Dashboard keys during synthesis and multi-job queue mode:
 
 - `p`: pause/resume
-- `r`: arm retry pass for failed chunks
+- `r`: arm retry pass for failed chunks/jobs
 - `q`: cancel run
 
 ## Resume Workflow
@@ -203,19 +276,19 @@ Dashboard keys during synthesis:
 If a job fails or gets interrupted, resume unfinished jobs:
 
 ```bash
-python3 pipeline.py --resume
+t2s --resume
 ```
 
 Resume one specific job:
 
 ```bash
-python3 pipeline.py --resume-job work/tmp/<job-folder>
+t2s --resume-job work/tmp/<job-folder>
 ```
 
 or:
 
 ```bash
-python3 pipeline.py --resume-job work/tmp/<job-folder>/job_manifest.json
+t2s --resume-job work/tmp/<job-folder>/job_manifest.json
 ```
 
 Each job manifest tracks per-step status (`extract`, `clean`, `tts`, `merge`) and run status (`in_progress`, `completed`, `failed`).
@@ -225,13 +298,13 @@ Each job manifest tracks per-step status (`extract`, `clean`, `tts`, `merge`) an
 Validate environment requirements before running:
 
 ```bash
-python3 pipeline.py --doctor-only
+t2s --doctor-only
 ```
 
 Run doctor first, then continue into pipeline only if checks pass:
 
 ```bash
-python3 pipeline.py --doctor
+t2s --doctor
 ```
 
 ## Watch Mode
@@ -239,7 +312,7 @@ python3 pipeline.py --doctor
 Watch `input/` continuously and auto-process new/changed files:
 
 ```bash
-python3 pipeline.py --watch
+t2s --watch
 ```
 
 Useful watch flags:
@@ -255,12 +328,34 @@ After each run (`batch`, `resume`, `watch`) a JSON report is written to:
 - `work/reports/run-YYYYMMDD-HHMMSS-ffffff.json`
 - `work/reports/latest_run.json`
 
+Reports now include analytics totals and per-job metrics:
+
+- generated characters
+- estimated cost
+- TTS duration / job duration
+- failures
+- cache hit rate
+
+## Tests
+
+Run automated tests:
+
+```bash
+pytest -q
+```
+
+Lint:
+
+```bash
+ruff check .
+```
+
 ## Direct TTS Script (Prepared TXT Input)
 
 If you already have a clean text file:
 
 ```bash
-python3 make_mp3.py --input /path/to/book.txt --output-dir out_mp3
+t2s-make --input /path/to/book.txt --output-dir out_mp3
 ```
 
 ## Notes

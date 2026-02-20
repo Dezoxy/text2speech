@@ -1,0 +1,10 @@
+# Optional external pronunciation dictionary for t2s / t2s-make.
+# Use with: --pronunciation-file pronunciation.toml
+
+[aliases]
+ChatGPT = "Cset G P T"
+OCR = "O C R"
+SSML = "S S M L"
+TTS = "T T S"
+API = "A P I"
+PDF = "P D F"

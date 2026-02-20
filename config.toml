@@ -4,6 +4,7 @@
 input = "input"
 work_dir = "work"
 out_dir = "out"
+cache_dir = "work/cache"
 
 [pipeline]
 ocr = "auto"
@@ -14,6 +15,7 @@ ocr_page_min_alpha_ratio = 0.22
 ocr_page_max_replacement_ratio = 0.02
 ocr_page_min_score = 0.24
 ocr_auto_bad_page_ratio = 0.10
+voice_profile = "academic"
 lang = "hu-HU"
 voice_name = "hu-HU-Chirp3-HD-Erinome"
 max_chars = 3500
@@ -25,6 +27,67 @@ cleanup_diff_preview = true
 cleanup_diff_max_lines = 200
 dashboard = true
 export_m4b = true
+chunk_cache = true
+workers = 1
+# 0 disables global request rate limiting.
+rate_limit_rps = 0.0
+retry_failed_chunks = true
+retry_failed_jobs = true
+
+[voice_profiles.academic]
+lang = "hu-HU"
+voice_name = "hu-HU-Chirp3-HD-Erinome"
+speaking_rate = 0.94
+pitch = -1.0
+max_chars = 3200
+use_ssml = true
+
+[voice_profiles.novel]
+lang = "hu-HU"
+voice_name = "hu-HU-Chirp3-HD-Erinome"
+speaking_rate = 1.02
+pitch = 0.0
+max_chars = 3500
+use_ssml = true
+
+[voice_profiles."scan-heavy"]
+lang = "hu-HU"
+voice_name = "hu-HU-Chirp3-HD-Erinome"
+speaking_rate = 0.92
+pitch = -0.4
+max_chars = 2800
+use_ssml = true
+ocr = "always"
+cleanup_diff_preview = true
+
+[pronunciation]
+case_sensitive = false
+
+[pronunciation.aliases]
+ChatGPT = "Cset G P T"
+OCR = "O C R"
+SSML = "S S M L"
+TTS = "T T S"
+
+[ssml_rules]
+acronym_mode = "auto"
+acronym_min_len = 2
+acronym_max_len = 5
+acronym_include = ["AI", "API", "PDF", "MP3", "M4B"]
+acronym_exclude = ["CHAPTER", "FEJEZET"]
+
+[export]
+book_title = ""
+book_author = ""
+cover_image = ""
+chapter_title_cleanup = true
+
+[retry]
+attempts = 6
+base_delay = 1.0
+backoff_factor = 1.8
+max_delay = 30.0
+jitter = 0.25
 
 [limits]
 # Set to null (or remove) for no hard limit.

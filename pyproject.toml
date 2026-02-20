@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "text2speech"
+version = "0.4.0"
+description = "PDF/TXT to audiobook pipeline with Google Cloud Text-to-Speech"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "google-cloud-texttospeech>=2.34.0",
+  "rich>=14.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6.0",
+]
+
+[project.scripts]
+t2s = "pipeline:main"
+t2s-make = "make_mp3:main"
+
+[tool.setuptools]
+py-modules = ["pipeline", "make_mp3", "text2speech_version"]

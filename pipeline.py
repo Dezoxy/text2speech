@@ -10,19 +10,49 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import make_mp3
+from text2speech_version import get_version
 
 DEFAULT_CONFIG_PATH = Path("config.toml")
 DEFAULT_DEPENDENCIES_PATH = Path("dependencies.toml")
 SUPPORTED_INPUT_SUFFIXES = (".pdf", ".txt")
+DEFAULT_VOICE_PROFILES: dict[str, dict[str, Any]] = {
+    "academic": {
+        "lang": "hu-HU",
+        "voice_name": "hu-HU-Chirp3-HD-Erinome",
+        "speaking_rate": 0.94,
+        "pitch": -1.0,
+        "max_chars": 3200,
+        "use_ssml": True,
+    },
+    "novel": {
+        "lang": "hu-HU",
+        "voice_name": "hu-HU-Chirp3-HD-Erinome",
+        "speaking_rate": 1.02,
+        "pitch": 0.0,
+        "max_chars": 3500,
+        "use_ssml": True,
+    },
+    "scan-heavy": {
+        "lang": "hu-HU",
+        "voice_name": "hu-HU-Chirp3-HD-Erinome",
+        "speaking_rate": 0.92,
+        "pitch": -0.4,
+        "max_chars": 2800,
+        "use_ssml": True,
+        "ocr": "always",
+        "cleanup_diff_preview": True,
+    },
+}
 
 
 @dataclass
@@ -61,6 +91,13 @@ class MissingDependency:
     required: bool
     install_target: str | None
     install_tool: str | None
+
+
+@dataclass
+class QueueJob:
+    label: str
+    target: str
+    run: Callable[[], tuple[Path, dict[str, Any]]]
 
 
 def now_iso() -> str:
@@ -457,6 +494,39 @@ def resolve_choice(value: str, name: str, choices: tuple[str, ...]) -> str:
     return value
 
 
+def parse_csv_items(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return []
+
+
+def normalize_profile_name(value: str) -> str:
+    return re.sub(r"[_\\s]+", "-", value.strip().lower())
+
+
+def build_voice_profiles(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    profiles = {name: dict(values) for name, values in DEFAULT_VOICE_PROFILES.items()}
+    config_profiles = config.get("voice_profiles", {})
+    if not isinstance(config_profiles, dict):
+        return profiles
+
+    for raw_name, raw_values in config_profiles.items():
+        if not isinstance(raw_name, str) or not isinstance(raw_values, dict):
+            continue
+        name = normalize_profile_name(raw_name)
+        base = dict(profiles.get(name, {}))
+        for key, value in raw_values.items():
+            if not isinstance(key, str):
+                continue
+            base[key] = value
+        profiles[name] = base
+    return profiles
+
+
 def resolve_runtime_args(parsed: argparse.Namespace, config: dict[str, Any]) -> argparse.Namespace:
     runtime = argparse.Namespace(**vars(parsed))
 
@@ -475,12 +545,41 @@ def resolve_runtime_args(parsed: argparse.Namespace, config: dict[str, Any]) -> 
         if parsed.out_dir is not None
         else cfg_get(config, "paths", "out_dir", "out")
     )
+    runtime.cache_dir = Path(
+        parsed.cache_dir
+        if parsed.cache_dir is not None
+        else cfg_get(config, "paths", "cache_dir", str(runtime.work_dir / "cache"))
+    )
+
+    voice_profiles = build_voice_profiles(config)
+    selected_profile_raw = (
+        parsed.voice_profile
+        if parsed.voice_profile is not None
+        else cfg_get(config, "pipeline", "voice_profile", None)
+    )
+    profile_overrides: dict[str, Any] = {}
+    runtime.voice_profile = None
+    if selected_profile_raw not in (None, "", "none"):
+        normalized = normalize_profile_name(str(selected_profile_raw))
+        if normalized not in voice_profiles:
+            available = ", ".join(sorted(voice_profiles))
+            raise RuntimeError(
+                f"Unknown voice profile: {selected_profile_raw}. "
+                f"Available profiles: {available}"
+            )
+        runtime.voice_profile = normalized
+        profile_overrides = dict(voice_profiles[normalized])
+
+    def cfg_pipeline(key: str, default: Any) -> Any:
+        if key in profile_overrides:
+            return profile_overrides[key]
+        return cfg_get(config, "pipeline", key, default)
 
     runtime.ocr = resolve_choice(
         str(
             parsed.ocr
             if parsed.ocr is not None
-            else cfg_get(config, "pipeline", "ocr", "auto")
+            else cfg_pipeline("ocr", "auto")
         ),
         "ocr",
         ("auto", "always", "never"),
@@ -488,73 +587,73 @@ def resolve_runtime_args(parsed: argparse.Namespace, config: dict[str, Any]) -> 
     runtime.ocr_lang = str(
         parsed.ocr_lang
         if parsed.ocr_lang is not None
-        else cfg_get(config, "pipeline", "ocr_lang", "hun+eng")
+        else cfg_pipeline("ocr_lang", "hun+eng")
     )
     runtime.ocr_page_min_chars = int(
         parsed.ocr_page_min_chars
         if parsed.ocr_page_min_chars is not None
-        else cfg_get(config, "pipeline", "ocr_page_min_chars", 30)
+        else cfg_pipeline("ocr_page_min_chars", 30)
     )
     runtime.ocr_page_min_alpha_ratio = float(
         parsed.ocr_page_min_alpha_ratio
         if parsed.ocr_page_min_alpha_ratio is not None
-        else cfg_get(config, "pipeline", "ocr_page_min_alpha_ratio", 0.22)
+        else cfg_pipeline("ocr_page_min_alpha_ratio", 0.22)
     )
     runtime.ocr_page_max_replacement_ratio = float(
         parsed.ocr_page_max_replacement_ratio
         if parsed.ocr_page_max_replacement_ratio is not None
-        else cfg_get(config, "pipeline", "ocr_page_max_replacement_ratio", 0.02)
+        else cfg_pipeline("ocr_page_max_replacement_ratio", 0.02)
     )
     runtime.ocr_page_min_score = float(
         parsed.ocr_page_min_score
         if parsed.ocr_page_min_score is not None
-        else cfg_get(config, "pipeline", "ocr_page_min_score", 0.24)
+        else cfg_pipeline("ocr_page_min_score", 0.24)
     )
     runtime.ocr_auto_bad_page_ratio = float(
         parsed.ocr_auto_bad_page_ratio
         if parsed.ocr_auto_bad_page_ratio is not None
-        else cfg_get(config, "pipeline", "ocr_auto_bad_page_ratio", 0.1)
+        else cfg_pipeline("ocr_auto_bad_page_ratio", 0.1)
     )
     runtime.cleanup_diff_preview = resolve_bool(
         parsed.cleanup_diff_preview,
-        cfg_get(config, "pipeline", "cleanup_diff_preview", True),
+        cfg_pipeline("cleanup_diff_preview", True),
         True,
     )
     runtime.cleanup_diff_max_lines = int(
         parsed.cleanup_diff_max_lines
         if parsed.cleanup_diff_max_lines is not None
-        else cfg_get(config, "pipeline", "cleanup_diff_max_lines", 200)
+        else cfg_pipeline("cleanup_diff_max_lines", 200)
     )
     runtime.lang = str(
         parsed.lang
         if parsed.lang is not None
-        else cfg_get(config, "pipeline", "lang", make_mp3.LANG)
+        else cfg_pipeline("lang", make_mp3.LANG)
     )
     runtime.voice_name = str(
         parsed.voice_name
         if parsed.voice_name is not None
-        else cfg_get(config, "pipeline", "voice_name", make_mp3.VOICE_NAME)
+        else cfg_pipeline("voice_name", make_mp3.VOICE_NAME)
     )
     runtime.max_chars = int(
         parsed.max_chars
         if parsed.max_chars is not None
-        else cfg_get(config, "pipeline", "max_chars", make_mp3.MAX_CHARS)
+        else cfg_pipeline("max_chars", make_mp3.MAX_CHARS)
     )
     runtime.speaking_rate = float(
         parsed.speaking_rate
         if parsed.speaking_rate is not None
-        else cfg_get(config, "pipeline", "speaking_rate", 1.0)
+        else cfg_pipeline("speaking_rate", 1.0)
     )
     runtime.pitch = float(
         parsed.pitch
         if parsed.pitch is not None
-        else cfg_get(config, "pipeline", "pitch", 0.0)
+        else cfg_pipeline("pitch", 0.0)
     )
     runtime.ui = resolve_choice(
         str(
             parsed.ui
             if parsed.ui is not None
-            else cfg_get(config, "pipeline", "ui", "auto")
+            else cfg_pipeline("ui", "auto")
         ),
         "ui",
         ("auto", "plain", "rich"),
@@ -587,19 +686,161 @@ def resolve_runtime_args(parsed: argparse.Namespace, config: dict[str, Any]) -> 
     )
     runtime.use_ssml = resolve_bool(
         parsed.use_ssml,
-        cfg_get(config, "pipeline", "use_ssml", True),
+        cfg_pipeline("use_ssml", True),
         True,
     )
     runtime.dashboard = resolve_bool(
         parsed.dashboard,
-        cfg_get(config, "pipeline", "dashboard", True),
+        cfg_pipeline("dashboard", True),
+        True,
+    )
+    runtime.chunk_cache = resolve_bool(
+        parsed.chunk_cache,
+        cfg_pipeline("chunk_cache", True),
+        True,
+    )
+    runtime.workers = int(
+        parsed.workers
+        if parsed.workers is not None
+        else cfg_pipeline("workers", 1)
+    )
+    rate_limit_value = (
+        parsed.rate_limit_rps
+        if parsed.rate_limit_rps is not None
+        else cfg_pipeline("rate_limit_rps", None)
+    )
+    if rate_limit_value in (None, 0, 0.0, "0", "0.0"):
+        runtime.rate_limit_rps = None
+    else:
+        runtime.rate_limit_rps = float(rate_limit_value)
+    runtime.retry_attempts = int(
+        parsed.retry_attempts
+        if parsed.retry_attempts is not None
+        else cfg_get(config, "retry", "attempts", make_mp3.RETRY_ATTEMPTS)
+    )
+    runtime.retry_base_delay = float(
+        parsed.retry_base_delay
+        if parsed.retry_base_delay is not None
+        else cfg_get(config, "retry", "base_delay", 1.0)
+    )
+    runtime.retry_backoff_factor = float(
+        parsed.retry_backoff_factor
+        if parsed.retry_backoff_factor is not None
+        else cfg_get(config, "retry", "backoff_factor", 1.8)
+    )
+    runtime.retry_max_delay = float(
+        parsed.retry_max_delay
+        if parsed.retry_max_delay is not None
+        else cfg_get(config, "retry", "max_delay", 30.0)
+    )
+    runtime.retry_jitter = float(
+        parsed.retry_jitter
+        if parsed.retry_jitter is not None
+        else cfg_get(config, "retry", "jitter", 0.25)
+    )
+    runtime.retry_failed_chunks = resolve_bool(
+        parsed.retry_failed_chunks,
+        cfg_pipeline("retry_failed_chunks", True),
+        True,
+    )
+    runtime.retry_failed_jobs = resolve_bool(
+        parsed.retry_failed_jobs,
+        cfg_pipeline("retry_failed_jobs", True),
         True,
     )
     runtime.export_m4b = resolve_bool(
         parsed.export_m4b,
-        cfg_get(config, "pipeline", "export_m4b", True),
+        cfg_pipeline("export_m4b", True),
         True,
     )
+
+    pronunciation_cfg = config.get("pronunciation", {})
+    if not isinstance(pronunciation_cfg, dict):
+        pronunciation_cfg = {}
+    pronunciation_file_value = (
+        parsed.pronunciation_file
+        if parsed.pronunciation_file is not None
+        else pronunciation_cfg.get("file")
+    )
+    runtime.pronunciation_file = (
+        Path(str(pronunciation_file_value)).expanduser()
+        if pronunciation_file_value not in (None, "")
+        else None
+    )
+    runtime.pronunciation_case_sensitive = resolve_bool(
+        parsed.pronunciation_case_sensitive,
+        pronunciation_cfg.get("case_sensitive", False),
+        False,
+    )
+    aliases_cfg = pronunciation_cfg.get("aliases", {})
+    runtime.pronunciation_aliases = (
+        make_mp3.normalize_aliases_map(aliases_cfg) if isinstance(aliases_cfg, dict) else {}
+    )
+
+    ssml_rules_cfg = config.get("ssml_rules", {})
+    if not isinstance(ssml_rules_cfg, dict):
+        ssml_rules_cfg = {}
+    runtime.acronym_mode = resolve_choice(
+        str(
+            parsed.acronym_mode
+            if parsed.acronym_mode is not None
+            else ssml_rules_cfg.get("acronym_mode", "auto")
+        ),
+        "acronym_mode",
+        ("off", "auto", "list"),
+    )
+    runtime.acronym_min_len = int(
+        parsed.acronym_min_len
+        if parsed.acronym_min_len is not None
+        else ssml_rules_cfg.get("acronym_min_len", 2)
+    )
+    runtime.acronym_max_len = int(
+        parsed.acronym_max_len
+        if parsed.acronym_max_len is not None
+        else ssml_rules_cfg.get("acronym_max_len", 5)
+    )
+    runtime.acronym_include = parse_csv_items(
+        parsed.acronym_include
+        if parsed.acronym_include is not None
+        else ssml_rules_cfg.get("acronym_include", [])
+    )
+    runtime.acronym_exclude = parse_csv_items(
+        parsed.acronym_exclude
+        if parsed.acronym_exclude is not None
+        else ssml_rules_cfg.get("acronym_exclude", [])
+    )
+
+    export_cfg = config.get("export", {})
+    if not isinstance(export_cfg, dict):
+        export_cfg = {}
+    book_title_value = (
+        parsed.book_title
+        if parsed.book_title is not None
+        else export_cfg.get("book_title", "")
+    )
+    book_author_value = (
+        parsed.book_author
+        if parsed.book_author is not None
+        else export_cfg.get("book_author", "")
+    )
+    cover_image_value = (
+        parsed.cover_image
+        if parsed.cover_image is not None
+        else export_cfg.get("cover_image")
+    )
+    runtime.book_title = str(book_title_value).strip() if str(book_title_value).strip() else None
+    runtime.book_author = str(book_author_value).strip() if str(book_author_value).strip() else None
+    runtime.cover_image = (
+        Path(str(cover_image_value)).expanduser()
+        if cover_image_value not in (None, "")
+        else None
+    )
+    runtime.chapter_title_cleanup = resolve_bool(
+        parsed.chapter_title_cleanup,
+        export_cfg.get("chapter_title_cleanup", True),
+        True,
+    )
+
     runtime.confirm_before_spend = resolve_bool(
         parsed.confirm_before_spend,
         cfg_get(config, "limits", "confirm_before_spend", False),
@@ -638,11 +879,25 @@ def build_job_config_snapshot(args: argparse.Namespace) -> dict[str, Any]:
         "ocr_auto_bad_page_ratio": args.ocr_auto_bad_page_ratio,
         "cleanup_diff_preview": args.cleanup_diff_preview,
         "cleanup_diff_max_lines": args.cleanup_diff_max_lines,
+        "cache_dir": str(args.cache_dir),
+        "voice_profile": args.voice_profile,
         "lang": args.lang,
         "voice_name": args.voice_name,
         "max_chars": args.max_chars,
         "speaking_rate": args.speaking_rate,
         "pitch": args.pitch,
+        "pronunciation_file": str(args.pronunciation_file) if args.pronunciation_file is not None else None,
+        "pronunciation_case_sensitive": args.pronunciation_case_sensitive,
+        "pronunciation_aliases": dict(args.pronunciation_aliases),
+        "acronym_mode": args.acronym_mode,
+        "acronym_min_len": args.acronym_min_len,
+        "acronym_max_len": args.acronym_max_len,
+        "acronym_include": list(args.acronym_include),
+        "acronym_exclude": list(args.acronym_exclude),
+        "book_title": args.book_title,
+        "book_author": args.book_author,
+        "cover_image": str(args.cover_image) if args.cover_image is not None else None,
+        "chapter_title_cleanup": args.chapter_title_cleanup,
         "skip_tts": args.skip_tts,
         "skip_merge": args.skip_merge,
         "ui": args.ui,
@@ -652,6 +907,16 @@ def build_job_config_snapshot(args: argparse.Namespace) -> dict[str, Any]:
         "test_write_placeholders": args.test_write_placeholders,
         "use_ssml": args.use_ssml,
         "dashboard": args.dashboard,
+        "chunk_cache": args.chunk_cache,
+        "workers": args.workers,
+        "rate_limit_rps": args.rate_limit_rps,
+        "retry_attempts": args.retry_attempts,
+        "retry_base_delay": args.retry_base_delay,
+        "retry_backoff_factor": args.retry_backoff_factor,
+        "retry_max_delay": args.retry_max_delay,
+        "retry_jitter": args.retry_jitter,
+        "retry_failed_chunks": args.retry_failed_chunks,
+        "retry_failed_jobs": args.retry_failed_jobs,
         "export_m4b": args.export_m4b,
         "confirm_before_spend": args.confirm_before_spend,
         "max_chars_per_run": args.max_chars_per_run,
@@ -687,6 +952,11 @@ def apply_manifest_defaults_for_resume(
         job_args.cleanup_diff_preview = bool(cfg["cleanup_diff_preview"])
     if raw_args.cleanup_diff_max_lines is None and "cleanup_diff_max_lines" in cfg:
         job_args.cleanup_diff_max_lines = int(cfg["cleanup_diff_max_lines"])
+    if raw_args.cache_dir is None and "cache_dir" in cfg:
+        job_args.cache_dir = Path(str(cfg["cache_dir"]))
+    if raw_args.voice_profile is None and "voice_profile" in cfg:
+        raw_profile = cfg["voice_profile"]
+        job_args.voice_profile = str(raw_profile) if raw_profile is not None else None
     if raw_args.lang is None and "lang" in cfg:
         job_args.lang = str(cfg["lang"])
     if raw_args.voice_name is None and "voice_name" in cfg:
@@ -701,10 +971,66 @@ def apply_manifest_defaults_for_resume(
         job_args.ui = str(cfg["ui"])
     if raw_args.use_ssml is None and "use_ssml" in cfg:
         job_args.use_ssml = bool(cfg["use_ssml"])
+    if raw_args.pronunciation_file is None and "pronunciation_file" in cfg:
+        raw_pron_file = cfg["pronunciation_file"]
+        job_args.pronunciation_file = (
+            Path(str(raw_pron_file))
+            if raw_pron_file not in (None, "")
+            else None
+        )
+    if raw_args.pronunciation_case_sensitive is None and "pronunciation_case_sensitive" in cfg:
+        job_args.pronunciation_case_sensitive = bool(cfg["pronunciation_case_sensitive"])
+    if "pronunciation_aliases" in cfg and isinstance(cfg["pronunciation_aliases"], dict):
+        job_args.pronunciation_aliases = make_mp3.normalize_aliases_map(cfg["pronunciation_aliases"])
+    if raw_args.acronym_mode is None and "acronym_mode" in cfg:
+        job_args.acronym_mode = str(cfg["acronym_mode"])
+    if raw_args.acronym_min_len is None and "acronym_min_len" in cfg:
+        job_args.acronym_min_len = int(cfg["acronym_min_len"])
+    if raw_args.acronym_max_len is None and "acronym_max_len" in cfg:
+        job_args.acronym_max_len = int(cfg["acronym_max_len"])
+    if raw_args.acronym_include is None and "acronym_include" in cfg:
+        job_args.acronym_include = parse_csv_items(cfg["acronym_include"])
+    if raw_args.acronym_exclude is None and "acronym_exclude" in cfg:
+        job_args.acronym_exclude = parse_csv_items(cfg["acronym_exclude"])
     if raw_args.dashboard is None and "dashboard" in cfg:
         job_args.dashboard = bool(cfg["dashboard"])
+    if raw_args.chunk_cache is None and "chunk_cache" in cfg:
+        job_args.chunk_cache = bool(cfg["chunk_cache"])
+    if raw_args.workers is None and "workers" in cfg:
+        job_args.workers = int(cfg["workers"])
+    if raw_args.rate_limit_rps is None and "rate_limit_rps" in cfg:
+        raw_rate = cfg["rate_limit_rps"]
+        if raw_rate in (None, 0, 0.0):
+            job_args.rate_limit_rps = None
+        else:
+            job_args.rate_limit_rps = float(raw_rate)
+    if raw_args.retry_attempts is None and "retry_attempts" in cfg:
+        job_args.retry_attempts = int(cfg["retry_attempts"])
+    if raw_args.retry_base_delay is None and "retry_base_delay" in cfg:
+        job_args.retry_base_delay = float(cfg["retry_base_delay"])
+    if raw_args.retry_backoff_factor is None and "retry_backoff_factor" in cfg:
+        job_args.retry_backoff_factor = float(cfg["retry_backoff_factor"])
+    if raw_args.retry_max_delay is None and "retry_max_delay" in cfg:
+        job_args.retry_max_delay = float(cfg["retry_max_delay"])
+    if raw_args.retry_jitter is None and "retry_jitter" in cfg:
+        job_args.retry_jitter = float(cfg["retry_jitter"])
+    if raw_args.retry_failed_chunks is None and "retry_failed_chunks" in cfg:
+        job_args.retry_failed_chunks = bool(cfg["retry_failed_chunks"])
+    if raw_args.retry_failed_jobs is None and "retry_failed_jobs" in cfg:
+        job_args.retry_failed_jobs = bool(cfg["retry_failed_jobs"])
     if raw_args.export_m4b is None and "export_m4b" in cfg:
         job_args.export_m4b = bool(cfg["export_m4b"])
+    if raw_args.book_title is None and "book_title" in cfg:
+        raw_title = str(cfg["book_title"]).strip()
+        job_args.book_title = raw_title or None
+    if raw_args.book_author is None and "book_author" in cfg:
+        raw_author = str(cfg["book_author"]).strip()
+        job_args.book_author = raw_author or None
+    if raw_args.cover_image is None and "cover_image" in cfg:
+        raw_cover = cfg["cover_image"]
+        job_args.cover_image = Path(str(raw_cover)) if raw_cover not in (None, "") else None
+    if raw_args.chapter_title_cleanup is None and "chapter_title_cleanup" in cfg:
+        job_args.chapter_title_cleanup = bool(cfg["chapter_title_cleanup"])
     if raw_args.confirm_before_spend is None and "confirm_before_spend" in cfg:
         job_args.confirm_before_spend = bool(cfg["confirm_before_spend"])
     if raw_args.max_chars_per_run is None and "max_chars_per_run" in cfg:
@@ -1011,7 +1337,7 @@ def write_cleanup_diff_preview(
         "",
     ]
 
-    body = preview_lines
+    body = list(preview_lines)
     if not body:
         body = ["(No line-level differences detected)"]
     if truncated_lines > 0:
@@ -1351,12 +1677,51 @@ def load_chapter_ranges(path: Path) -> list[dict[str, Any]]:
     return ranges
 
 
+def cleanup_chapter_title(title: str, fallback_index: int) -> str:
+    text = title.replace("\n", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.strip(" -_:;,.|")
+    if not text:
+        return f"Chapter {fallback_index}"
+
+    match = re.match(
+        r"^(chapter|chap\.?|fejezet|r[eé]sz)\s+([0-9ivxlcdm]+)\s*[-:.\s]*(.*)$",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        label = match.group(1).title()
+        number = match.group(2).upper()
+        rest = match.group(3).strip(" -_:;,.|")
+        if rest:
+            return f"{label} {number} - {rest}"
+        return f"{label} {number}"
+
+    return text
+
+
+def derive_book_title(input_path: Path, output_stem: str, explicit_title: str | None) -> str:
+    if explicit_title and explicit_title.strip():
+        return explicit_title.strip()
+
+    source = input_path.stem if input_path.stem else output_stem
+    source = source.replace("_", " ").replace("-", " ")
+    source = re.sub(r"\s+", " ", source).strip()
+    if not source:
+        source = output_stem
+    return source.title()
+
+
 def export_chaptered_m4b(
     *,
     chunks_dir: Path,
     merged_mp3: Path,
     output_m4b: Path,
     chapter_map_path: Path | None,
+    book_title: str,
+    book_author: str | None,
+    cover_image: Path | None,
+    cleanup_titles: bool,
 ) -> dict[str, Any]:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -1382,6 +1747,15 @@ def export_chaptered_m4b(
 
     metadata_file = chunks_dir / "chapters.ffmeta"
     lines = [";FFMETADATA1", f"title={output_m4b.stem}"]
+    if book_title.strip():
+        lines.append(f"title={book_title.strip()}")
+        lines.append(f"album={book_title.strip()}")
+    if book_author and book_author.strip():
+        author = book_author.strip()
+        lines.append(f"artist={author}")
+        lines.append(f"album_artist={author}")
+        lines.append(f"author={author}")
+
     for item in chapters:
         start_chunk = min(max(int(item["start_chunk"]), 0), len(mp3_files) - 1)
         end_chunk = min(max(int(item["end_chunk"]), start_chunk), len(mp3_files) - 1)
@@ -1389,7 +1763,11 @@ def export_chaptered_m4b(
         end_ms = cumulative[end_chunk + 1]
         if end_ms <= start_ms:
             end_ms = start_ms + 1
-        title = str(item["title"]).replace("\n", " ").strip() or "Chapter"
+        raw_title = str(item["title"]).replace("\n", " ").strip() or "Chapter"
+        if cleanup_titles:
+            title = cleanup_chapter_title(raw_title, int(item.get("chapter_index", 0)) + 1)
+        else:
+            title = raw_title
 
         lines.extend(
             [
@@ -1402,32 +1780,56 @@ def export_chaptered_m4b(
         )
 
     metadata_file.write_text("\n".join(lines) + "\n")
-    run_command(
-        [
-            ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            str(merged_mp3),
-            "-i",
-            str(metadata_file),
-            "-map_metadata",
-            "1",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "96k",
-            str(output_m4b),
-        ],
-        "ffmpeg m4b export",
-    )
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(merged_mp3),
+        "-i",
+        str(metadata_file),
+        "-map",
+        "0:a",
+        "-map_metadata",
+        "1",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "96k",
+    ]
+
+    cover_attached = False
+    if cover_image is not None:
+        if cover_image.exists():
+            cmd.extend(
+                [
+                    "-i",
+                    str(cover_image),
+                    "-map",
+                    "2:v",
+                    "-c:v",
+                    "mjpeg",
+                    "-disposition:v:0",
+                    "attached_pic",
+                ]
+            )
+            cover_attached = True
+        else:
+            print(f"Cover image not found, skipping cover attach: {cover_image}")
+
+    cmd.append(str(output_m4b))
+    run_command(cmd, "ffmpeg m4b export")
     return {
         "m4b_exported": True,
         "output_m4b": str(output_m4b),
         "chapter_count": len(chapters),
         "chapter_metadata": str(metadata_file),
+        "book_title": book_title,
+        "book_author": book_author or "",
+        "cover_attached": cover_attached,
+        "chapter_title_cleanup": bool(cleanup_titles),
     }
 
 
@@ -1484,6 +1886,117 @@ def build_job_record(manifest_path: Path, manifest: dict[str, Any]) -> dict[str,
     }
 
 
+def iso_duration_seconds(start_iso: str | None, end_iso: str | None) -> float | None:
+    if not start_iso or not end_iso:
+        return None
+    try:
+        start = datetime.fromisoformat(start_iso)
+        end = datetime.fromisoformat(end_iso)
+    except ValueError:
+        return None
+    duration = (end - start).total_seconds()
+    if duration < 0:
+        return None
+    return duration
+
+
+def build_run_analytics(
+    jobs: list[dict[str, Any]],
+    failures: list[tuple[str, str]],
+) -> dict[str, Any]:
+    per_job: list[dict[str, Any]] = []
+    total_chars = 0
+    total_billable_chars = 0
+    total_cost_usd = 0.0
+    total_tts_duration_s = 0.0
+    total_job_duration_s = 0.0
+    total_tts_failures = 0
+    total_cache_hits = 0
+    total_cache_misses = 0
+
+    for record in jobs:
+        manifest_path_raw = record.get("manifest_path")
+        if not isinstance(manifest_path_raw, str) or not manifest_path_raw:
+            continue
+
+        manifest_path = Path(manifest_path_raw)
+        if not manifest_path.exists():
+            continue
+
+        try:
+            manifest = read_manifest(manifest_path)
+        except Exception:  # noqa: BLE001
+            continue
+
+        steps = manifest.get("steps", {})
+        tts_step = steps.get("tts", {}) if isinstance(steps, dict) else {}
+        tts_summary = tts_step.get("summary", {}) if isinstance(tts_step, dict) else {}
+        if not isinstance(tts_summary, dict):
+            tts_summary = {}
+
+        chars = int(tts_summary.get("generated_chars", 0) or 0)
+        billable = int(tts_summary.get("run_billable_chars", 0) or 0)
+        cost = float(tts_summary.get("run_estimated_cost_usd", 0.0) or 0.0)
+        tts_duration = float(tts_summary.get("run_duration_s", 0.0) or 0.0)
+        tts_failures = int(tts_summary.get("failures", 0) or 0)
+        cache_hits = int(tts_summary.get("cache_hits", 0) or 0)
+        generated_chunks = int(tts_summary.get("generated", 0) or 0)
+        chunk_attempts = max(0, generated_chunks + cache_hits)
+        cache_misses = max(0, chunk_attempts - cache_hits)
+        cache_hit_rate = (cache_hits / chunk_attempts) if chunk_attempts > 0 else 0.0
+
+        job_duration = iso_duration_seconds(
+            str(manifest.get("created_at", "")) or None,
+            str(manifest.get("updated_at", "")) or None,
+        )
+
+        total_chars += chars
+        total_billable_chars += billable
+        total_cost_usd += cost
+        total_tts_duration_s += tts_duration
+        total_tts_failures += tts_failures
+        total_cache_hits += cache_hits
+        total_cache_misses += cache_misses
+        if job_duration is not None:
+            total_job_duration_s += job_duration
+
+        per_job.append(
+            {
+                "manifest_path": str(manifest_path),
+                "input": manifest.get("input"),
+                "status": manifest.get("status"),
+                "generated_chars": chars,
+                "run_billable_chars": billable,
+                "run_estimated_cost_usd": round(cost, 6),
+                "tts_duration_s": round(tts_duration, 3),
+                "job_duration_s": round(job_duration, 3) if job_duration is not None else None,
+                "tts_failures": tts_failures,
+                "cache_hits": cache_hits,
+                "cache_misses": cache_misses,
+                "cache_hit_rate": round(cache_hit_rate, 4),
+            }
+        )
+
+    cache_total = total_cache_hits + total_cache_misses
+    overall_cache_hit_rate = (total_cache_hits / cache_total) if cache_total > 0 else 0.0
+
+    return {
+        "totals": {
+            "generated_chars": total_chars,
+            "run_billable_chars": total_billable_chars,
+            "run_estimated_cost_usd": round(total_cost_usd, 6),
+            "tts_duration_s": round(total_tts_duration_s, 3),
+            "job_duration_s": round(total_job_duration_s, 3),
+            "tts_failures": total_tts_failures,
+            "failed_jobs": len(failures),
+            "cache_hits": total_cache_hits,
+            "cache_misses": total_cache_misses,
+            "cache_hit_rate": round(overall_cache_hit_rate, 4),
+        },
+        "jobs": per_job,
+    }
+
+
 def write_run_report(
     work_dir: Path,
     *,
@@ -1496,14 +2009,21 @@ def write_run_report(
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     generated_at = now_iso()
+    analytics = build_run_analytics(jobs, failures)
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": generated_at,
         "mode": mode,
         "args": {
             "input": str(args.input),
             "work_dir": str(args.work_dir),
             "out_dir": str(args.out_dir),
+            "cache_dir": str(args.cache_dir),
+            "voice_profile": args.voice_profile,
+            "book_title": args.book_title,
+            "book_author": args.book_author,
+            "cover_image": str(args.cover_image) if args.cover_image is not None else None,
+            "chapter_title_cleanup": bool(args.chapter_title_cleanup),
             "resume": bool(getattr(args, "resume", False)),
             "resume_job": str(args.resume_job) if getattr(args, "resume_job", None) else None,
             "test_run": bool(args.test_run),
@@ -1517,9 +2037,27 @@ def write_run_report(
             "ocr_page_min_score": float(args.ocr_page_min_score),
             "ocr_auto_bad_page_ratio": float(args.ocr_auto_bad_page_ratio),
             "use_ssml": bool(args.use_ssml),
+            "pronunciation_file": str(args.pronunciation_file) if args.pronunciation_file is not None else None,
+            "pronunciation_case_sensitive": bool(args.pronunciation_case_sensitive),
+            "pronunciation_aliases": len(args.pronunciation_aliases),
+            "acronym_mode": str(args.acronym_mode),
+            "acronym_min_len": int(args.acronym_min_len),
+            "acronym_max_len": int(args.acronym_max_len),
+            "acronym_include": list(args.acronym_include),
+            "acronym_exclude": list(args.acronym_exclude),
             "cleanup_diff_preview": bool(args.cleanup_diff_preview),
             "cleanup_diff_max_lines": int(args.cleanup_diff_max_lines),
             "dashboard": bool(args.dashboard),
+            "chunk_cache": bool(args.chunk_cache),
+            "workers": int(args.workers),
+            "rate_limit_rps": args.rate_limit_rps,
+            "retry_attempts": int(args.retry_attempts),
+            "retry_base_delay": float(args.retry_base_delay),
+            "retry_backoff_factor": float(args.retry_backoff_factor),
+            "retry_max_delay": float(args.retry_max_delay),
+            "retry_jitter": float(args.retry_jitter),
+            "retry_failed_chunks": bool(args.retry_failed_chunks),
+            "retry_failed_jobs": bool(args.retry_failed_jobs),
             "export_m4b": bool(args.export_m4b),
             "max_chars_per_run": args.max_chars_per_run,
             "max_cost_usd": args.max_cost_usd,
@@ -1531,6 +2069,7 @@ def write_run_report(
             "completed_jobs": sum(1 for job in jobs if str(job.get("status")) == "completed"),
             "failed_jobs": len(failures),
         },
+        "analytics": analytics,
         "jobs": jobs,
         "failures": [{"target": target, "error": error} for target, error in failures],
     }
@@ -1876,10 +2415,28 @@ def run_job(
                 test_delay=args.test_delay,
                 test_write_placeholders=args.test_write_placeholders,
                 use_ssml=args.use_ssml,
+                pronunciation_file=args.pronunciation_file,
+                pronunciation_aliases=args.pronunciation_aliases,
+                pronunciation_case_sensitive=args.pronunciation_case_sensitive,
+                acronym_mode=args.acronym_mode,
+                acronym_min_len=args.acronym_min_len,
+                acronym_max_len=args.acronym_max_len,
+                acronym_include=args.acronym_include,
+                acronym_exclude=args.acronym_exclude,
                 max_chars_per_run=args.max_chars_per_run,
                 max_cost_usd=args.max_cost_usd,
                 confirm_before_spend=args.confirm_before_spend,
                 dashboard=args.dashboard,
+                workers=args.workers,
+                rate_limit_rps=args.rate_limit_rps,
+                retry_attempts=args.retry_attempts,
+                retry_base_delay_s=args.retry_base_delay,
+                retry_backoff_factor=args.retry_backoff_factor,
+                retry_max_delay_s=args.retry_max_delay,
+                retry_jitter_s=args.retry_jitter,
+                retry_failed_chunks=args.retry_failed_chunks,
+                chunk_cache=args.chunk_cache,
+                cache_dir=args.cache_dir,
             )
 
             if tts_summary.get("estimate_only"):
@@ -1958,11 +2515,20 @@ def run_job(
             if merge_summary.get("merged"):
                 m4b_summary: dict[str, Any] = {"m4b_exported": False, "reason": "export disabled"}
                 if args.export_m4b:
+                    book_title = derive_book_title(
+                        input_path=input_path,
+                        output_stem=output_stem,
+                        explicit_title=args.book_title,
+                    )
                     m4b_summary = export_chaptered_m4b(
                         chunks_dir=chunks_dir,
                         merged_mp3=final_output_mp3,
                         output_m4b=final_output_m4b,
                         chapter_map_path=chapter_map_json,
+                        book_title=book_title,
+                        book_author=args.book_author,
+                        cover_image=args.cover_image,
+                        cleanup_titles=bool(args.chapter_title_cleanup),
                     )
                 set_step(
                     manifest_path,
@@ -2250,9 +2816,260 @@ def run_watch_loop(
     return jobs, failures
 
 
+def queue_dashboard_enabled(args: argparse.Namespace, total_jobs: int) -> bool:
+    if total_jobs <= 1:
+        return False
+    if not bool(args.dashboard):
+        return False
+    use_rich = make_mp3.should_use_rich_ui(args.ui)
+    return use_rich and sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def build_queue_dashboard_view(
+    *,
+    mode_label: str,
+    states: list[dict[str, Any]],
+    pass_index: int,
+    retry_armed: bool,
+    paused: bool,
+    cancelled: bool,
+    events: list[str],
+) -> Any:
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.table import Table
+
+    total = len(states)
+    completed = sum(1 for item in states if item.get("status") == "completed")
+    failed = sum(1 for item in states if item.get("status") == "failed")
+    running = sum(1 for item in states if item.get("status") == "running")
+    cancelled_count = sum(1 for item in states if item.get("status") == "cancelled")
+
+    summary = (
+        f"Mode: {mode_label}\n"
+        f"Pass: {pass_index}\n"
+        f"Jobs: {total} | Running: {running} | Completed: {completed} | Failed: {failed} | Cancelled: {cancelled_count}\n"
+        f"Retry Failed Jobs: {'armed' if retry_armed else 'off'} | "
+        f"Paused: {'yes' if paused else 'no'} | Cancel Requested: {'yes' if cancelled else 'no'}"
+    )
+
+    table = Table(title="Job Queue", show_header=True)
+    table.add_column("#", justify="right")
+    table.add_column("Job")
+    table.add_column("Status")
+    table.add_column("Attempts", justify="right")
+    table.add_column("Error")
+
+    for idx, item in enumerate(states, start=1):
+        status = str(item.get("status", "queued"))
+        attempts = str(item.get("attempts", 0))
+        err = str(item.get("error", ""))
+        if len(err) > 90:
+            err = err[:87] + "..."
+        table.add_row(str(idx), str(item.get("label", "-")), status, attempts, err)
+
+    controls = (
+        "Controls: p pause/resume queue | r arm retry failed jobs after pass | "
+        "q cancel remaining jobs"
+    )
+    events_text = "\n".join(events[-8:]) if events else "No events yet."
+    return Group(
+        Panel(summary, title="Queue Summary", expand=False),
+        table,
+        Panel(controls, title="Controls", expand=False),
+        Panel(events_text, title="Events", expand=False),
+    )
+
+
+def run_job_queue(
+    *,
+    args: argparse.Namespace,
+    mode_label: str,
+    queue_jobs: list[QueueJob],
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+    if not queue_jobs:
+        return [], []
+
+    dashboard = queue_dashboard_enabled(args, len(queue_jobs))
+    retry_armed = bool(args.retry_failed_jobs)
+    paused = False
+    cancelled = False
+    pass_index = 1
+    events: list[str] = []
+
+    states: list[dict[str, Any]] = [
+        {
+            "label": job.label,
+            "status": "queued",
+            "attempts": 0,
+            "error": "",
+        }
+        for job in queue_jobs
+    ]
+
+    job_records: list[dict[str, Any]] = []
+    failure_map: dict[int, tuple[str, str]] = {}
+
+    def handle_keys() -> None:
+        nonlocal paused, retry_armed, cancelled
+        if not dashboard:
+            return
+        while True:
+            key = make_mp3.poll_dashboard_key()
+            if key is None:
+                return
+            key = key.lower()
+            if key == "p":
+                paused = not paused
+                events.append("Queue paused." if paused else "Queue resumed.")
+            elif key == "r":
+                retry_armed = True
+                events.append("Retry failed jobs armed.")
+            elif key == "q":
+                cancelled = True
+                events.append("Cancel requested. Current running job will finish.")
+
+    def run_one(idx: int) -> None:
+        state = states[idx]
+        state["status"] = "running"
+        state["attempts"] = int(state.get("attempts", 0)) + 1
+        state["error"] = ""
+
+        holder: dict[str, Any] = {}
+
+        def worker() -> None:
+            try:
+                holder["result"] = queue_jobs[idx].run()
+            except Exception as exc:  # noqa: BLE001
+                holder["error"] = exc
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        while thread.is_alive():
+            handle_keys()
+            if dashboard and live_obj is not None:
+                live_obj.update(
+                    build_queue_dashboard_view(
+                        mode_label=mode_label,
+                        states=states,
+                        pass_index=pass_index,
+                        retry_armed=retry_armed,
+                        paused=paused,
+                        cancelled=cancelled,
+                        events=events,
+                    )
+                )
+            thread.join(timeout=0.1)
+        thread.join()
+
+        if "error" in holder:
+            error_text = str(holder["error"])
+            state["status"] = "failed"
+            state["error"] = error_text
+            failure_map[idx] = (queue_jobs[idx].target, error_text)
+            events.append(f"Failed {queue_jobs[idx].label}: {error_text}")
+            return
+
+        manifest_path, manifest = holder["result"]
+        state["status"] = "completed"
+        state["error"] = ""
+        failure_map.pop(idx, None)
+        job_records.append(build_job_record(manifest_path, manifest))
+        events.append(f"Completed {queue_jobs[idx].label}")
+
+    pending_indices = list(range(len(queue_jobs)))
+    live_obj: Any | None = None
+
+    if dashboard:
+        from rich.live import Live
+
+        with make_mp3.dashboard_keyboard_mode(True):
+            with Live(
+                build_queue_dashboard_view(
+                    mode_label=mode_label,
+                    states=states,
+                    pass_index=pass_index,
+                    retry_armed=retry_armed,
+                    paused=paused,
+                    cancelled=cancelled,
+                    events=events,
+                ),
+                refresh_per_second=8,
+            ) as live:
+                live_obj = live
+                while pending_indices:
+                    idx = pending_indices.pop(0)
+                    while paused and not cancelled:
+                        handle_keys()
+                        live.update(
+                            build_queue_dashboard_view(
+                                mode_label=mode_label,
+                                states=states,
+                                pass_index=pass_index,
+                                retry_armed=retry_armed,
+                                paused=paused,
+                                cancelled=cancelled,
+                                events=events,
+                            )
+                        )
+                        time.sleep(0.1)
+                    if cancelled:
+                        break
+                    run_one(idx)
+
+                if not cancelled and retry_armed:
+                    retry_indices = [idx for idx, item in enumerate(states) if item.get("status") == "failed"]
+                    if retry_indices:
+                        pass_index = 2
+                        events.append(f"Retry pass starting for {len(retry_indices)} failed job(s).")
+                        for idx in retry_indices:
+                            if cancelled:
+                                break
+                            run_one(idx)
+
+                if cancelled:
+                    for item in states:
+                        if item.get("status") == "queued":
+                            item["status"] = "cancelled"
+                            item["error"] = "cancelled"
+
+                live.update(
+                    build_queue_dashboard_view(
+                        mode_label=mode_label,
+                        states=states,
+                        pass_index=pass_index,
+                        retry_armed=retry_armed,
+                        paused=paused,
+                        cancelled=cancelled,
+                        events=events,
+                    )
+                )
+    else:
+        while pending_indices:
+            idx = pending_indices.pop(0)
+            print(f"\n[{idx + 1}/{len(queue_jobs)}] {queue_jobs[idx].label}")
+            run_one(idx)
+
+        if retry_armed:
+            retry_indices = [idx for idx, item in enumerate(states) if item.get("status") == "failed"]
+            if retry_indices:
+                print(f"\nRetry pass for failed jobs: {len(retry_indices)}")
+                pass_index = 2
+                for idx in retry_indices:
+                    run_one(idx)
+
+    failures = [failure_map[idx] for idx in sorted(failure_map)]
+    return job_records, failures
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Automate PDF/TXT -> cleanup/OCR -> TTS with input/, work/tmp/, out/ layout"
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {get_version()}",
     )
     parser.add_argument(
         "--config",
@@ -2295,6 +3112,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Directory for finished merged .mp3 outputs (default from config or out)",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="Directory for reusable chunk cache (default from config or <work-dir>/cache)",
     )
     parser.add_argument(
         "--job-name",
@@ -2346,6 +3169,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--lang",
         default=None,
         help="Google TTS language code",
+    )
+    parser.add_argument(
+        "--voice-profile",
+        default=None,
+        help="Voice profile preset (for example: academic, novel, scan-heavy)",
     )
     parser.add_argument(
         "--voice-name",
@@ -2419,6 +3247,46 @@ def build_parser() -> argparse.ArgumentParser:
         help="Shape text chunks as SSML before TTS",
     )
     parser.add_argument(
+        "--pronunciation-file",
+        type=Path,
+        default=None,
+        help="Path to pronunciation dictionary (.toml/.json or key=value text)",
+    )
+    parser.add_argument(
+        "--pronunciation-case-sensitive",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Treat pronunciation dictionary keys as case-sensitive",
+    )
+    parser.add_argument(
+        "--acronym-mode",
+        choices=("off", "auto", "list"),
+        default=None,
+        help="Acronym SSML behavior: off, auto, or list-only",
+    )
+    parser.add_argument(
+        "--acronym-min-len",
+        type=int,
+        default=None,
+        help="Minimum acronym length for auto mode",
+    )
+    parser.add_argument(
+        "--acronym-max-len",
+        type=int,
+        default=None,
+        help="Maximum acronym length for auto mode",
+    )
+    parser.add_argument(
+        "--acronym-include",
+        default=None,
+        help="Comma-separated acronyms to force spell-out (works with auto/list)",
+    )
+    parser.add_argument(
+        "--acronym-exclude",
+        default=None,
+        help="Comma-separated acronyms to never spell-out",
+    )
+    parser.add_argument(
         "--cleanup-diff-preview",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -2437,10 +3305,92 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable rich full-screen dashboard with pause/resume controls",
     )
     parser.add_argument(
+        "--chunk-cache",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable reusable chunk cache",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Parallel synthesis workers (dashboard mode stays sequential)",
+    )
+    parser.add_argument(
+        "--rate-limit-rps",
+        type=float,
+        default=None,
+        help="Max API request starts per second across workers",
+    )
+    parser.add_argument(
+        "--retry-attempts",
+        type=int,
+        default=None,
+        help="Retry attempts per API call",
+    )
+    parser.add_argument(
+        "--retry-base-delay",
+        type=float,
+        default=None,
+        help="Initial retry backoff delay in seconds",
+    )
+    parser.add_argument(
+        "--retry-backoff-factor",
+        type=float,
+        default=None,
+        help="Exponential multiplier for retry delay",
+    )
+    parser.add_argument(
+        "--retry-max-delay",
+        type=float,
+        default=None,
+        help="Cap for retry delay in seconds",
+    )
+    parser.add_argument(
+        "--retry-jitter",
+        type=float,
+        default=None,
+        help="Random jitter added to each retry delay in seconds",
+    )
+    parser.add_argument(
+        "--retry-failed-chunks",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Retry failed chunks once after main synthesis pass",
+    )
+    parser.add_argument(
+        "--retry-failed-jobs",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Retry failed jobs once after the first queue pass",
+    )
+    parser.add_argument(
         "--export-m4b",
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Export chaptered .m4b in addition to merged .mp3",
+    )
+    parser.add_argument(
+        "--book-title",
+        default=None,
+        help="Metadata title used for .m4b export (defaults to input filename)",
+    )
+    parser.add_argument(
+        "--book-author",
+        default=None,
+        help="Metadata author/artist used for .m4b export",
+    )
+    parser.add_argument(
+        "--cover-image",
+        type=Path,
+        default=None,
+        help="Optional cover image path to embed into .m4b",
+    )
+    parser.add_argument(
+        "--chapter-title-cleanup",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Normalize noisy chapter titles before writing .m4b chapters",
     )
     parser.add_argument(
         "--max-cost-usd",
@@ -2526,6 +3476,24 @@ def main() -> None:
         raise SystemExit("--max-chars-per-run must be > 0")
     if args.max_cost_usd is not None and args.max_cost_usd < 0:
         raise SystemExit("--max-cost-usd must be >= 0")
+    if args.workers < 1:
+        raise SystemExit("--workers must be >= 1")
+    if args.rate_limit_rps is not None and args.rate_limit_rps <= 0:
+        raise SystemExit("--rate-limit-rps must be > 0")
+    if args.retry_attempts < 1:
+        raise SystemExit("--retry-attempts must be >= 1")
+    if args.retry_base_delay < 0:
+        raise SystemExit("--retry-base-delay must be >= 0")
+    if args.retry_backoff_factor < 1.0:
+        raise SystemExit("--retry-backoff-factor must be >= 1")
+    if args.retry_max_delay < 0:
+        raise SystemExit("--retry-max-delay must be >= 0")
+    if args.retry_jitter < 0:
+        raise SystemExit("--retry-jitter must be >= 0")
+    if args.acronym_min_len < 1:
+        raise SystemExit("--acronym-min-len must be >= 1")
+    if args.acronym_max_len < args.acronym_min_len:
+        raise SystemExit("--acronym-max-len must be >= --acronym-min-len")
     if args.ocr_page_min_chars < 0:
         raise SystemExit("--ocr-page-min-chars must be >= 0")
     if not 0.0 <= args.ocr_page_min_alpha_ratio <= 1.0:
@@ -2538,6 +3506,8 @@ def main() -> None:
         raise SystemExit("--ocr-auto-bad-page-ratio must be in [0, 1]")
     if args.cleanup_diff_max_lines <= 0:
         raise SystemExit("--cleanup-diff-max-lines must be > 0")
+    if args.pronunciation_file is not None and not args.pronunciation_file.exists():
+        raise SystemExit(f"Pronunciation file does not exist: {args.pronunciation_file}")
 
     if raw_args.watch and (raw_args.resume or raw_args.resume_job is not None):
         raise SystemExit("Cannot combine --watch with --resume or --resume-job")
@@ -2586,14 +3556,32 @@ def main() -> None:
             raise SystemExit(str(exc)) from exc
 
         print(f"Resuming jobs: {len(resume_manifests)}")
-        for index, manifest_path in enumerate(resume_manifests, start=1):
-            print(f"\n[{index}/{len(resume_manifests)}] Resume {manifest_path.parent.name}")
-            try:
-                manifest = resume_job_from_manifest(args=args, raw_args=raw_args, manifest_path=manifest_path)
-                job_records.append(build_job_record(manifest_path, manifest))
-            except Exception as exc:  # noqa: BLE001
-                failures.append((str(manifest_path), str(exc)))
-                print(f"Failed resume {manifest_path}: {exc}")
+        resume_job_args = args
+        if queue_dashboard_enabled(args, len(resume_manifests)):
+            # Avoid nested rich dashboards: queue dashboard stays active, per-job dashboard is disabled.
+            resume_job_args = argparse.Namespace(**vars(args))
+            resume_job_args.dashboard = False
+        queue_jobs: list[QueueJob] = []
+        for manifest_path in resume_manifests:
+            queue_jobs.append(
+                QueueJob(
+                    label=f"Resume {manifest_path.parent.name}",
+                    target=str(manifest_path),
+                    run=lambda manifest_path=manifest_path: (
+                        manifest_path,
+                        resume_job_from_manifest(
+                            args=resume_job_args,
+                            raw_args=raw_args,
+                            manifest_path=manifest_path,
+                        ),
+                    ),
+                )
+            )
+        job_records, failures = run_job_queue(
+            args=args,
+            mode_label="resume",
+            queue_jobs=queue_jobs,
+        )
 
         write_run_report(
             work_dir=work_dir,
@@ -2657,30 +3645,47 @@ def main() -> None:
     if args.job_name and len(input_files) > 1:
         print("Ignoring --job-name because multiple input files were discovered.")
 
+    batch_job_args = args
+    if queue_dashboard_enabled(args, len(input_files)):
+        # Avoid nested rich dashboards: queue dashboard stays active, per-job dashboard is disabled.
+        batch_job_args = argparse.Namespace(**vars(args))
+        batch_job_args.dashboard = False
+
+    def run_new_job(input_path: Path, output_stem: str) -> tuple[Path, dict[str, Any]]:
+        manifest = process_single_input_new_job(
+            args=batch_job_args,
+            input_path=input_path,
+            work_tmp_root=work_tmp_root,
+            out_dir=out_dir,
+            output_stem=output_stem,
+        )
+        manifest_path = Path(manifest.get("tmp_dir", "")).resolve() / "job_manifest.json"
+        return manifest_path, manifest
+
     used_stems: dict[str, int] = {}
-
-    for index, input_path in enumerate(input_files, start=1):
-        print(f"\n[{index}/{len(input_files)}] Processing {input_path.name}")
-
+    queue_jobs: list[QueueJob] = []
+    for input_path in input_files:
         if args.job_name and len(input_files) == 1:
             base_stem = slugify(args.job_name)
         else:
             base_stem = slugify(input_path.stem)
         output_stem = unique_stem(base_stem, used_stems)
-
-        try:
-            manifest = process_single_input_new_job(
-                args=args,
-                input_path=input_path,
-                work_tmp_root=work_tmp_root,
-                out_dir=out_dir,
-                output_stem=output_stem,
+        queue_jobs.append(
+            QueueJob(
+                label=f"Process {input_path.name}",
+                target=str(input_path),
+                run=lambda input_path=input_path, output_stem=output_stem: run_new_job(
+                    input_path=input_path,
+                    output_stem=output_stem,
+                ),
             )
-            manifest_path = Path(manifest.get("tmp_dir", "")).resolve() / "job_manifest.json"
-            job_records.append(build_job_record(manifest_path, manifest))
-        except Exception as exc:  # noqa: BLE001
-            failures.append((input_path.name, str(exc)))
-            print(f"Failed {input_path.name}: {exc}")
+        )
+
+    job_records, failures = run_job_queue(
+        args=args,
+        mode_label="batch",
+        queue_jobs=queue_jobs,
+    )
 
     write_run_report(
         work_dir=work_dir,

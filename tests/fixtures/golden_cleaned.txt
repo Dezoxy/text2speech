@@ -1,0 +1,7 @@
+CHAPTER 1
+
+This is first paragraph. This is second line with hyphenation.
+
+CHAPTER 2
+
+Second chapter starts here.
