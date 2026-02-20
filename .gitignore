@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and local env files
+.venv/
+venv/
+.env
+.env.*
+
+# Common Python tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Project-generated outputs
+out_mp3/
+*.mp3
+*.mp3.tmp
+concat_list.txt
+
+# Local source/backups (keep machine-local by default)
+book.txt
+*.bak
+*.pre_tts.bak
+*.pdf
