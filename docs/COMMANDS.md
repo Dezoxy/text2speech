@@ -181,3 +181,37 @@ Every `pipeline.py` run writes JSON reports to:
 
 - `work/reports/run-YYYYMMDD-HHMMSS-ffffff.json`
 - `work/reports/latest_run.json`
+
+## 11) Dependency Precheck + Install Prompt
+
+Uses `dependencies.toml` by default and checks dependencies at startup for both `pipeline.py` and `make_mp3.py`.
+If required Python deps are present in local `.venv`, the app auto-relaunches with `.venv/bin/python`.
+If system Python is externally managed, Python deps are installed into local `.venv` and the app relaunches automatically.
+
+Default startup behavior:
+
+```bash
+python3 pipeline.py
+python3 make_mp3.py --input /path/to/book.txt
+```
+
+Use a custom dependency file:
+
+```bash
+python3 pipeline.py --deps-file /path/to/dependencies.toml
+python3 make_mp3.py --input /path/to/book.txt --deps-file /path/to/dependencies.toml
+```
+
+Check dependencies but do not auto-install:
+
+```bash
+python3 pipeline.py --no-deps-auto-install
+python3 make_mp3.py --input /path/to/book.txt --no-deps-auto-install
+```
+
+Skip startup dependency precheck:
+
+```bash
+python3 pipeline.py --no-deps-check
+python3 make_mp3.py --input /path/to/book.txt --no-deps-check
+```

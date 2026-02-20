@@ -30,6 +30,7 @@ CLI args always override config values.
 
 - `pipeline.py`: End-to-end flow (`input -> OCR/extract -> cleanup -> TTS -> out/*.mp3`).
 - `make_mp3.py`: Direct TTS chunk generator for already prepared `.txt` files.
+- `dependencies.toml`: dependency manifest used by startup precheck/installer.
 - `docs/COMMANDS.md`: command cheat sheet.
 
 ## System Requirements
@@ -83,6 +84,43 @@ Useful options:
 - `--test-write-placeholders` / `--no-test-write-placeholders`
 - `--doctor` / `--doctor-only`
 - `--watch --watch-interval 5 --watch-stable-seconds 3`
+- `--deps-file dependencies.toml`
+- `--deps-check` / `--no-deps-check`
+- `--deps-auto-install` / `--no-deps-auto-install`
+
+## Dependency Precheck
+
+At startup, `pipeline.py` and `make_mp3.py` read `dependencies.toml`, check installed dependencies, and show exactly what is missing.
+
+If there are missing items and auto-install is enabled, it asks for your confirmation before installing anything.
+If required Python dependencies already exist in local `.venv`, the app auto-relaunches with `.venv/bin/python`.
+On Homebrew-managed Python (PEP 668), Python packages are installed into local `.venv`, then the app auto-relaunches.
+
+Default behavior:
+
+- `--deps-check` is enabled
+- `--deps-auto-install` is enabled (still asks for approval)
+
+Example:
+
+```bash
+python3 pipeline.py
+python3 make_mp3.py --input /path/to/book.txt
+```
+
+Check-only mode (no installer prompt):
+
+```bash
+python3 pipeline.py --no-deps-auto-install
+python3 make_mp3.py --input /path/to/book.txt --no-deps-auto-install
+```
+
+Skip startup dependency precheck:
+
+```bash
+python3 pipeline.py --no-deps-check
+python3 make_mp3.py --input /path/to/book.txt --no-deps-check
+```
 
 ## Resume Workflow
 
