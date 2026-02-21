@@ -5,6 +5,7 @@ import difflib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -388,6 +389,11 @@ def resolve_runtime_args(parsed: argparse.Namespace, config: dict[str, Any]) -> 
         cfg_pipeline("cleanup_diff_preview", True),
         True,
     )
+    runtime.review_before_tts = resolve_bool(
+        parsed.review_before_tts,
+        cfg_get(config, "flags", "review_before_tts", False),
+        False,
+    )
     runtime.cleanup_diff_max_lines = int(
         parsed.cleanup_diff_max_lines
         if parsed.cleanup_diff_max_lines is not None
@@ -648,6 +654,7 @@ def build_job_config_snapshot(args: argparse.Namespace) -> dict[str, Any]:
         "ocr_page_min_score": args.ocr_page_min_score,
         "ocr_auto_bad_page_ratio": args.ocr_auto_bad_page_ratio,
         "cleanup_diff_preview": args.cleanup_diff_preview,
+        "review_before_tts": args.review_before_tts,
         "cleanup_diff_max_lines": args.cleanup_diff_max_lines,
         "cache_dir": str(args.cache_dir),
         "voice_profile": args.voice_profile,
@@ -722,6 +729,8 @@ def apply_manifest_defaults_for_resume(
         job_args.ocr_auto_bad_page_ratio = float(cfg["ocr_auto_bad_page_ratio"])
     if raw_args.cleanup_diff_preview is None and "cleanup_diff_preview" in cfg:
         job_args.cleanup_diff_preview = bool(cfg["cleanup_diff_preview"])
+    if raw_args.review_before_tts is None and "review_before_tts" in cfg:
+        job_args.review_before_tts = bool(cfg["review_before_tts"])
     if raw_args.cleanup_diff_max_lines is None and "cleanup_diff_max_lines" in cfg:
         job_args.cleanup_diff_max_lines = int(cfg["cleanup_diff_max_lines"])
     if raw_args.cache_dir is None and "cache_dir" in cfg:
@@ -1078,6 +1087,9 @@ def looks_like_noise_line(line: str) -> bool:
     if any(re.match(p, lower) for p in patterns):
         return True
 
+    if re.match(r"^(tartalomjegyz[eé]k|table of contents|contents)\s*:?\s*$", lower):
+        return True
+
     if lower.startswith("ábrajegyzék"):
         return True
 
@@ -1208,6 +1220,51 @@ def write_cleanup_diff_preview(
         "truncated": truncated_lines > 0,
         "truncated_lines": truncated_lines,
     }
+
+
+def prompt_review_before_tts(*, raw_txt: Path, tts_input_txt: Path) -> None:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise RuntimeError("--review-before-tts requires interactive terminal input.")
+
+    editor_value = os.getenv("VISUAL") or os.getenv("EDITOR")
+    editor_cmd: list[str] | None = None
+    if editor_value:
+        try:
+            editor_cmd = shlex.split(editor_value)
+        except ValueError:
+            editor_cmd = None
+
+    print("\nPre-TTS review is enabled.")
+    print(f"Raw text: {raw_txt}")
+    print(f"TTS input text: {tts_input_txt}")
+    if editor_cmd is None:
+        print("Set $EDITOR or $VISUAL to open files from this prompt automatically.")
+
+    while True:
+        if editor_cmd is None:
+            choice = input("Review action: [c] continue, [q] cancel: ").strip().lower()
+        else:
+            choice = input(
+                "Review action: [e] edit TTS text, [r] edit raw text, [c] continue, [q] cancel: "
+            ).strip().lower()
+
+        if choice in {"", "c", "continue"}:
+            return
+        if choice in {"q", "quit"}:
+            raise RuntimeError("Cancelled by user during --review-before-tts prompt.")
+
+        if editor_cmd is None:
+            print("Unknown option. Choose 'c' to continue or 'q' to cancel.")
+            continue
+
+        if choice in {"e", "edit"}:
+            subprocess.run([*editor_cmd, str(tts_input_txt)], check=False)
+            continue
+        if choice in {"r", "raw"}:
+            subprocess.run([*editor_cmd, str(raw_txt)], check=False)
+            continue
+
+        print("Unknown option. Choose e, r, c, or q.")
 
 
 def write_manifest(path: Path, manifest: dict[str, Any]) -> None:
@@ -2200,6 +2257,9 @@ def run_job(
         ):
             print("Resume: TTS already completed.")
         else:
+            if bool(args.review_before_tts):
+                prompt_review_before_tts(raw_txt=raw_txt, tts_input_txt=tts_input_txt)
+
             set_step(manifest_path, manifest, "tts", "in_progress")
             tts_summary = make_mp3.run_tts(
                 input_txt=tts_input_txt,
@@ -3134,6 +3194,12 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Write raw-vs-clean preview diff before TTS",
+    )
+    parser.add_argument(
+        "--review-before-tts",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Pause after cleanup so you can review/edit text files before TTS starts",
     )
     parser.add_argument(
         "--cleanup-diff-max-lines",

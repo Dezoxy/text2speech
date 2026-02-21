@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import io
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -80,6 +82,7 @@ def test_classify_txt_input_auto_whitespace_only_diff_skips_clean() -> None:
 def test_clean_for_audiobook_drops_figure_and_source_reference_lines() -> None:
     raw = (
         "Ez egy hasznos bekezdes.\n"
+        "Tartalomjegyzék\n"
         "ábra 2 - Valami illusztracio.\n"
         "What is Amazon EC2 Auto Scaling?\n"
         "Predictive scaling for Amazon EC2 Auto Scaling - Amazon EC2 Auto Scaling\n"
@@ -89,12 +92,51 @@ def test_clean_for_audiobook_drops_figure_and_source_reference_lines() -> None:
 
     cleaned = pipeline.clean_for_audiobook(raw)
 
+    assert "Tartalomjegyzék" not in cleaned
     assert "ábra 2" not in cleaned
     assert "What is Amazon EC2 Auto Scaling?" not in cleaned
     assert "Predictive scaling for Amazon EC2 Auto Scaling" not in cleaned
     assert "AWS News Blog" not in cleaned
     assert "Ez egy hasznos bekezdes." in cleaned
     assert "Ez maradjon benne." in cleaned
+
+
+def test_prompt_review_before_tts_requires_interactive_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    raw = tmp_path / "raw.txt"
+    tts_input = tmp_path / "clean.txt"
+    raw.write_text("raw")
+    tts_input.write_text("clean")
+
+    monkeypatch.setattr(pipeline.sys, "stdin", SimpleNamespace(isatty=lambda: False))
+    monkeypatch.setattr(pipeline.sys, "stdout", SimpleNamespace(isatty=lambda: True))
+
+    with pytest.raises(RuntimeError, match="requires interactive terminal input"):
+        pipeline.prompt_review_before_tts(raw_txt=raw, tts_input_txt=tts_input)
+
+
+def test_prompt_review_before_tts_allows_continue_without_editor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    raw = tmp_path / "raw.txt"
+    tts_input = tmp_path / "clean.txt"
+    raw.write_text("raw")
+    tts_input.write_text("clean")
+
+    class TtyStringIO(io.StringIO):
+        def isatty(self) -> bool:  # noqa: D401
+            return True
+
+    monkeypatch.setattr(pipeline.sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(pipeline.sys, "stdout", TtyStringIO())
+    monkeypatch.delenv("EDITOR", raising=False)
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "c")
+
+    pipeline.prompt_review_before_tts(raw_txt=raw, tts_input_txt=tts_input)
 
 
 def test_validate_input_kind_for_path_rejects_pdf_mode_for_txt() -> None:

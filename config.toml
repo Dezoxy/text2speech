@@ -100,6 +100,7 @@ confirm_before_spend = true
 skip_tts = false
 skip_merge = false
 estimate_only = false
+review_before_tts = false
 test_run = false
 test_delay = 0.02
 test_write_placeholders = false

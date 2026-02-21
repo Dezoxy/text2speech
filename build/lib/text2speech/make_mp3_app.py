@@ -950,6 +950,12 @@ def is_figure_caption_paragraph(paragraph: str) -> bool:
     return bool(match and match.start() <= 40)
 
 
+def is_toc_heading_paragraph(paragraph: str) -> bool:
+    p = re.sub(r"\s+", " ", paragraph).strip().lower()
+    p = p.strip(" -_:;,.|")
+    return p in {"tartalomjegyzék", "tartalomjegyzek", "table of contents", "contents"}
+
+
 def is_reference_paragraph(paragraph: str) -> bool:
     p = re.sub(r"\s+", " ", paragraph).strip()
     if not p:
@@ -1009,7 +1015,8 @@ def clean_text(t: str) -> str:
     filtered_paragraphs = [
         p
         for p in paragraphs
-        if not is_figure_caption_paragraph(p)
+        if not is_toc_heading_paragraph(p)
+        and not is_figure_caption_paragraph(p)
         and not is_reference_paragraph(p)
         and not is_shouting_teaser_paragraph(p)
     ]

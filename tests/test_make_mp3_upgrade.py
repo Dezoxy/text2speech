@@ -273,6 +273,7 @@ def test_clean_text_filters_pdf_reference_artifacts() -> None:
 
     cleaned = make_mp3.clean_text(raw)
 
+    assert "Tartalomjegyzék" not in cleaned
     assert "AZ AMAZON S3 TABLES" not in cleaned
     assert "ábra 3" not in cleaned
     assert "What is Amazon EC2 Auto Scaling?" not in cleaned
