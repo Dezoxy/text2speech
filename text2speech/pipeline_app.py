@@ -1233,12 +1233,20 @@ def prompt_review_before_tts(*, raw_txt: Path, tts_input_txt: Path) -> None:
             editor_cmd = shlex.split(editor_value)
         except ValueError:
             editor_cmd = None
+    if editor_cmd is None:
+        for fallback in ("nano", "vim", "vi"):
+            fallback_path = shutil.which(fallback)
+            if fallback_path:
+                editor_cmd = [fallback_path]
+                break
 
     print("\nPre-TTS review is enabled.")
     print(f"Raw text: {raw_txt}")
     print(f"TTS input text: {tts_input_txt}")
     if editor_cmd is None:
         print("Set $EDITOR or $VISUAL to open files from this prompt automatically.")
+    else:
+        print(f"Editor: {' '.join(editor_cmd)}")
 
     while True:
         if editor_cmd is None:

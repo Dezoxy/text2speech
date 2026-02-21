@@ -123,6 +123,11 @@ class ChunkCachePlan:
     hit_candidate_chars: int
 
 
+@dataclass(frozen=True)
+class DashboardKeyboardState:
+    raw_mode: bool
+
+
 class RateLimiter:
     def __init__(self, rate_limit_rps: float | None) -> None:
         if rate_limit_rps is None or rate_limit_rps <= 0:
@@ -1356,26 +1361,31 @@ def confirm_before_spend_gate(preview: BillingPreview, enabled: bool) -> None:
 @contextmanager
 def dashboard_keyboard_mode(enabled: bool):
     if not enabled:
-        yield
+        yield DashboardKeyboardState(raw_mode=False)
         return
 
     try:
         import termios
         import tty
     except Exception:  # noqa: BLE001
-        yield
+        yield DashboardKeyboardState(raw_mode=False)
         return
 
-    fd = sys.stdin.fileno()
-    old_state = termios.tcgetattr(fd)
-    tty.setcbreak(fd)
     try:
-        yield
+        fd = sys.stdin.fileno()
+        old_state = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+    except Exception:  # noqa: BLE001
+        yield DashboardKeyboardState(raw_mode=False)
+        return
+
+    try:
+        yield DashboardKeyboardState(raw_mode=True)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_state)
 
 
-def poll_dashboard_key() -> str | None:
+def poll_dashboard_key(*, raw_mode: bool) -> str | None:
     if not sys.stdin.isatty():
         return None
     try:
@@ -1390,7 +1400,17 @@ def poll_dashboard_key() -> str | None:
     if not ready:
         return None
     try:
-        return sys.stdin.read(1)
+        if raw_mode:
+            return sys.stdin.read(1)
+        # Fallback for terminals where cbreak/raw mode is unavailable.
+        # In this mode users submit commands as "p<Enter>", "r<Enter>", etc.
+        line = sys.stdin.readline()
+        if not line:
+            return None
+        for ch in line:
+            if not ch.isspace():
+                return ch
+        return None
     except Exception:  # noqa: BLE001
         return None
 
@@ -1408,6 +1428,7 @@ def build_dashboard_view(
     cancelled: bool,
     current_chunk: str,
     events: list[str],
+    raw_key_mode: bool = True,
 ) -> Any:
     from rich.console import Group
     from rich.panel import Panel
@@ -1425,7 +1446,10 @@ def build_dashboard_view(
     summary.add_row("Retry Failed", "armed" if retry_requested else "off")
     summary.add_row("Cancelled", "yes" if cancelled else "no")
 
-    controls = "Controls: p pause/resume | r retry failed chunks after pass | q cancel"
+    if raw_key_mode:
+        controls = "Controls: p pause/resume | r retry failed chunks after pass | q cancel"
+    else:
+        controls = "Controls: p<Enter> pause/resume | r<Enter> retry failed | q<Enter> cancel"
     events_text = "\n".join(events[-6:]) if events else "No events yet."
 
     return Group(
@@ -1730,11 +1754,12 @@ def run_tts(
             cancelled = False
             current_chunk = "-"
             events: list[str] = []
+            raw_key_mode = True
 
             def handle_keys() -> None:
                 nonlocal paused, retry_requested, cancelled
                 while True:
-                    key = poll_dashboard_key()
+                    key = poll_dashboard_key(raw_mode=raw_key_mode)
                     if key is None:
                         return
                     key = key.lower()
@@ -1748,7 +1773,10 @@ def run_tts(
                         cancelled = True
                         events.append("Cancel requested.")
 
-            with dashboard_keyboard_mode(True):
+            with dashboard_keyboard_mode(True) as keyboard_state:
+                raw_key_mode = keyboard_state.raw_mode
+                if not raw_key_mode:
+                    events.append("Keyboard fallback active: type p/r/q then Enter.")
                 with Live(
                     build_dashboard_view(
                         preview=preview,
@@ -1762,6 +1790,7 @@ def run_tts(
                         cancelled=cancelled,
                         current_chunk=current_chunk,
                         events=events,
+                        raw_key_mode=raw_key_mode,
                     ),
                     refresh_per_second=8,
                 ) as live:
@@ -1782,6 +1811,7 @@ def run_tts(
                                     cancelled=cancelled,
                                     current_chunk=current_chunk,
                                     events=events,
+                                    raw_key_mode=raw_key_mode,
                                 )
                             )
                             time.sleep(0.1)
@@ -1826,6 +1856,7 @@ def run_tts(
                                 cancelled=cancelled,
                                 current_chunk=current_chunk,
                                 events=events,
+                                raw_key_mode=raw_key_mode,
                             )
                         )
         elif use_rich:
@@ -2032,11 +2063,12 @@ def run_tts(
             cancelled = False
             current_chunk = "-"
             events: list[str] = []
+            raw_key_mode = True
 
             def handle_keys() -> None:
                 nonlocal paused, retry_requested, cancelled
                 while True:
-                    key = poll_dashboard_key()
+                    key = poll_dashboard_key(raw_mode=raw_key_mode)
                     if key is None:
                         return
                     key = key.lower()
@@ -2050,7 +2082,10 @@ def run_tts(
                         cancelled = True
                         events.append("Cancel requested.")
 
-            with dashboard_keyboard_mode(True):
+            with dashboard_keyboard_mode(True) as keyboard_state:
+                raw_key_mode = keyboard_state.raw_mode
+                if not raw_key_mode:
+                    events.append("Keyboard fallback active: type p/r/q then Enter.")
                 with Live(
                     build_dashboard_view(
                         preview=preview,
@@ -2064,6 +2099,7 @@ def run_tts(
                         cancelled=cancelled,
                         current_chunk=current_chunk,
                         events=events,
+                        raw_key_mode=raw_key_mode,
                     ),
                     refresh_per_second=8,
                 ) as live:
@@ -2084,6 +2120,7 @@ def run_tts(
                                     cancelled=cancelled,
                                     current_chunk=current_chunk,
                                     events=events,
+                                    raw_key_mode=raw_key_mode,
                                 )
                             )
                             time.sleep(0.1)
@@ -2122,6 +2159,7 @@ def run_tts(
                                 cancelled=cancelled,
                                 current_chunk=current_chunk,
                                 events=events,
+                                raw_key_mode=raw_key_mode,
                             )
                         )
 
