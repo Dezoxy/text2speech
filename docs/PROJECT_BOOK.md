@@ -262,15 +262,15 @@ These reports are useful for:
 - throughput tuning
 - spotting unstable documents/jobs
 
-## Chapter 13: When To Use `t2s-make`
+## Chapter 13: When To Use `--input-kind clean-txt`
 
-Use `t2s-make` only when your text is already ready.
-It skips PDF extraction and cleanup pipeline steps.
+Use `t2s --input-kind clean-txt` when your text is already ready.
+It tells the pipeline to skip cleanup for clean TXT input.
 
 Example:
 
 ```bash
-t2s-make --input /path/to/book.txt --output-dir out_mp3 --ui rich --dashboard
+t2s --input /path/to/book.txt --input-kind clean-txt --ui rich --dashboard
 ```
 
 Best for:

@@ -122,6 +122,18 @@ class QueueJob:
     run: Callable[[], tuple[Path, dict[str, Any]]]
 
 
+@dataclass(frozen=True)
+class TxtInputClassification:
+    kind: str
+    reason: str
+    identical: bool
+    whitespace_only_change: bool
+    length_change_chars: int
+    length_change_ratio: float
+    raw_quality: dict[str, Any]
+    cleaned_quality: dict[str, Any]
+
+
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -312,6 +324,15 @@ def resolve_runtime_args(parsed: argparse.Namespace, config: dict[str, Any]) -> 
         ),
         "ocr",
         ("auto", "always", "never"),
+    )
+    runtime.input_kind = resolve_choice(
+        str(
+            parsed.input_kind
+            if parsed.input_kind is not None
+            else cfg_pipeline("input_kind", "auto")
+        ),
+        "input_kind",
+        ("auto", "clean-txt", "raw-txt", "pdf"),
     )
     runtime.ocr_lang = str(
         parsed.ocr_lang
@@ -599,6 +620,7 @@ def resolve_runtime_args(parsed: argparse.Namespace, config: dict[str, Any]) -> 
 
 def build_job_config_snapshot(args: argparse.Namespace) -> dict[str, Any]:
     return {
+        "input_kind": args.input_kind,
         "ocr": args.ocr,
         "ocr_lang": args.ocr_lang,
         "ocr_page_min_chars": args.ocr_page_min_chars,
@@ -665,6 +687,8 @@ def apply_manifest_defaults_for_resume(
 
     if raw_args.ocr is None and "ocr" in cfg:
         job_args.ocr = str(cfg["ocr"])
+    if raw_args.input_kind is None and "input_kind" in cfg:
+        job_args.input_kind = str(cfg["input_kind"])
     if raw_args.ocr_lang is None and "ocr_lang" in cfg:
         job_args.ocr_lang = str(cfg["ocr_lang"])
     if raw_args.ocr_page_min_chars is None and "ocr_page_min_chars" in cfg:
@@ -811,6 +835,52 @@ def assess_text_quality(text: str) -> TextQuality:
         whitespace_ratio=whitespace_ratio,
         score=round(score, 4),
         looks_good=looks_good,
+    )
+
+
+def classify_txt_input(raw_text: str, cleaned_text: str, *, requested_kind: str) -> TxtInputClassification:
+    if requested_kind not in {"auto", "raw-txt", "clean-txt"}:
+        raise RuntimeError(f"Unsupported --input-kind for TXT input: {requested_kind}")
+
+    raw_quality = assess_text_quality(raw_text)
+    cleaned_quality = assess_text_quality(cleaned_text)
+    identical = raw_text == cleaned_text
+    normalized_raw = " ".join(raw_text.split())
+    normalized_cleaned = " ".join(cleaned_text.split())
+    whitespace_only_change = (
+        not identical
+        and normalized_raw == normalized_cleaned
+    )
+    length_change_chars = abs(len(cleaned_text) - len(raw_text))
+    length_change_ratio = (
+        length_change_chars / max(1, len(raw_text))
+    )
+
+    if requested_kind == "clean-txt":
+        kind = "clean-txt"
+        reason = "forced-clean-txt"
+    elif requested_kind == "raw-txt":
+        kind = "raw-txt"
+        reason = "forced-raw-txt"
+    elif identical:
+        kind = "clean-txt"
+        reason = "auto-identical-after-cleanup"
+    elif whitespace_only_change:
+        kind = "clean-txt"
+        reason = "auto-whitespace-only-diff"
+    else:
+        kind = "raw-txt"
+        reason = "auto-cleanup-needed"
+
+    return TxtInputClassification(
+        kind=kind,
+        reason=reason,
+        identical=identical,
+        whitespace_only_change=whitespace_only_change,
+        length_change_chars=length_change_chars,
+        length_change_ratio=round(length_change_ratio, 6),
+        raw_quality=asdict(raw_quality),
+        cleaned_quality=asdict(cleaned_quality),
     )
 
 
@@ -1627,6 +1697,7 @@ def write_run_report(
         "test_run": bool(args.test_run),
         "estimate_only": bool(args.estimate_only),
         "watch": bool(getattr(args, "watch", False)),
+        "input_kind": str(args.input_kind),
         "ocr": str(args.ocr),
         "ocr_lang": str(args.ocr_lang),
         "ocr_page_min_chars": int(args.ocr_page_min_chars),
@@ -1859,6 +1930,7 @@ def run_job(
     ensure_manifest_basics(manifest, args, input_path, job_tmp_dir, out_dir, output_stem)
 
     raw_txt = job_tmp_dir / "raw.txt"
+    raw_input_txt = job_tmp_dir / "raw_input.txt"
     runtime_cfg = PipelineRuntimeConfig.from_namespace(args)
 
     clean_txt = job_tmp_dir / "clean_for_tts.txt"
@@ -1868,6 +1940,7 @@ def run_job(
     final_output_mp3 = out_dir / f"{output_stem}.mp3"
     final_output_m4b = out_dir / f"{output_stem}.m4b"
     ocr_thresholds = build_ocr_quality_thresholds(args)
+    tts_input_txt = clean_txt
 
     print(f"Input: {input_path}")
     print(f"Tmp dir: {job_tmp_dir}")
@@ -1904,8 +1977,7 @@ def run_job(
                 )
             elif input_path.suffix.lower() == ".txt":
                 raw_text = input_path.read_text(errors="ignore")
-                selected_txt = job_tmp_dir / "raw_input.txt"
-                selected_txt.write_text(raw_text)
+                raw_input_txt.write_text(raw_text)
                 raw_txt.write_text(raw_text)
                 set_step(
                     manifest_path,
@@ -1913,50 +1985,130 @@ def run_job(
                     "extract",
                     "completed",
                     mode="txt_input",
-                    selected_txt=str(selected_txt),
+                    selected_txt=str(raw_input_txt),
                     raw_txt=str(raw_txt),
                     quality=asdict(assess_text_quality(raw_text)),
+                    input_kind=runtime_cfg.input_kind,
                 )
             else:
                 raise RuntimeError("Unsupported input type. Use .pdf or .txt")
 
         # Step 2: clean
         current_step = "clean"
-        if resume and step_status(manifest, "clean") == "completed" and clean_txt.exists():
-            print("Resume: clean step already completed.")
+        clean_step_state = step_status(manifest, "clean")
+        clean_step = manifest.get("steps", {}).get("clean", {})
+        if (
+            resume
+            and clean_step_state in {"completed", "skipped"}
+            and (
+                (clean_step_state == "completed" and clean_txt.exists())
+                or (clean_step_state == "skipped" and raw_txt.exists())
+            )
+        ):
+            print(f"Resume: clean step already {clean_step_state}.")
+            tts_input_value = clean_step.get("tts_input_txt")
+            if isinstance(tts_input_value, str) and tts_input_value:
+                tts_candidate = Path(tts_input_value)
+                if tts_candidate.exists():
+                    tts_input_txt = tts_candidate
+            elif clean_step_state == "skipped" and raw_txt.exists():
+                tts_input_txt = raw_txt
         else:
             if not raw_txt.exists():
                 raise RuntimeError(f"Missing raw text for clean step: {raw_txt}")
 
             set_step(manifest_path, manifest, "clean", "in_progress")
             raw_text = raw_txt.read_text(errors="ignore")
-            cleaned = clean_for_audiobook(raw_text)
-            clean_txt.write_text(cleaned)
-            clean_diff_preview: dict[str, Any] | None = None
-            if runtime_cfg.cleanup_diff_preview:
-                clean_diff_preview = write_cleanup_diff_preview(
-                    raw_text=raw_text,
-                    cleaned_text=cleaned,
-                    output_path=clean_diff_preview_txt,
-                    max_lines=runtime_cfg.cleanup_diff_max_lines,
+            if input_path.suffix.lower() == ".txt":
+                if runtime_cfg.input_kind == "pdf":
+                    raise RuntimeError("--input-kind=pdf cannot be used with .txt input")
+
+                cleaned = clean_for_audiobook(raw_text)
+                txt_classification = classify_txt_input(
+                    raw_text,
+                    cleaned,
+                    requested_kind=runtime_cfg.input_kind,
                 )
-            set_step(
-                manifest_path,
-                manifest,
-                "clean",
-                "completed",
-                raw_txt=str(raw_txt),
-                clean_txt=str(clean_txt),
-                raw_chars=len(raw_text),
-                clean_chars=len(cleaned),
-                removed_chars=len(raw_text) - len(cleaned),
-                clean_quality=asdict(assess_text_quality(cleaned)),
-                cleanup_diff_preview=clean_diff_preview,
-                cleanup_diff_preview_enabled=bool(runtime_cfg.cleanup_diff_preview),
-            )
+                if txt_classification.kind == "clean-txt":
+                    tts_input_txt = raw_txt
+                    set_step(
+                        manifest_path,
+                        manifest,
+                        "clean",
+                        "skipped",
+                        reason=txt_classification.reason,
+                        raw_txt=str(raw_txt),
+                        clean_txt=None,
+                        raw_chars=len(raw_text),
+                        clean_chars=len(raw_text),
+                        removed_chars=0,
+                        clean_quality=txt_classification.raw_quality,
+                        cleanup_diff_preview=None,
+                        cleanup_diff_preview_enabled=False,
+                        tts_input_txt=str(tts_input_txt),
+                        txt_input_classification=asdict(txt_classification),
+                    )
+                else:
+                    clean_txt.write_text(cleaned)
+                    tts_input_txt = clean_txt
+                    clean_diff_preview: dict[str, Any] | None = None
+                    if runtime_cfg.cleanup_diff_preview:
+                        clean_diff_preview = write_cleanup_diff_preview(
+                            raw_text=raw_text,
+                            cleaned_text=cleaned,
+                            output_path=clean_diff_preview_txt,
+                            max_lines=runtime_cfg.cleanup_diff_max_lines,
+                        )
+                    set_step(
+                        manifest_path,
+                        manifest,
+                        "clean",
+                        "completed",
+                        raw_txt=str(raw_txt),
+                        clean_txt=str(clean_txt),
+                        raw_chars=len(raw_text),
+                        clean_chars=len(cleaned),
+                        removed_chars=len(raw_text) - len(cleaned),
+                        clean_quality=txt_classification.cleaned_quality,
+                        cleanup_diff_preview=clean_diff_preview,
+                        cleanup_diff_preview_enabled=bool(runtime_cfg.cleanup_diff_preview),
+                        tts_input_txt=str(tts_input_txt),
+                        txt_input_classification=asdict(txt_classification),
+                    )
+            else:
+                cleaned = clean_for_audiobook(raw_text)
+                clean_txt.write_text(cleaned)
+                tts_input_txt = clean_txt
+                clean_diff_preview: dict[str, Any] | None = None
+                if runtime_cfg.cleanup_diff_preview:
+                    clean_diff_preview = write_cleanup_diff_preview(
+                        raw_text=raw_text,
+                        cleaned_text=cleaned,
+                        output_path=clean_diff_preview_txt,
+                        max_lines=runtime_cfg.cleanup_diff_max_lines,
+                    )
+                set_step(
+                    manifest_path,
+                    manifest,
+                    "clean",
+                    "completed",
+                    raw_txt=str(raw_txt),
+                    clean_txt=str(clean_txt),
+                    raw_chars=len(raw_text),
+                    clean_chars=len(cleaned),
+                    removed_chars=len(raw_text) - len(cleaned),
+                    clean_quality=asdict(assess_text_quality(cleaned)),
+                    cleanup_diff_preview=clean_diff_preview,
+                    cleanup_diff_preview_enabled=bool(runtime_cfg.cleanup_diff_preview),
+                    tts_input_txt=str(tts_input_txt),
+                )
 
         print(f"Raw text: {raw_txt}")
-        print(f"Cleaned text: {clean_txt}")
+        if tts_input_txt == raw_txt:
+            print("Clean step skipped; TXT input already looks cleaned.")
+            print(f"TTS input: {tts_input_txt}")
+        else:
+            print(f"Cleaned text: {clean_txt}")
         if runtime_cfg.cleanup_diff_preview and clean_diff_preview_txt.exists():
             print(f"Cleanup diff preview: {clean_diff_preview_txt}")
 
@@ -1992,7 +2144,7 @@ def run_job(
         else:
             set_step(manifest_path, manifest, "tts", "in_progress")
             tts_summary = make_mp3.run_tts(
-                input_txt=clean_txt,
+                input_txt=tts_input_txt,
                 out_dir=chunks_dir,
                 lang=runtime_cfg.lang,
                 voice_name=runtime_cfg.voice_name,
@@ -2417,6 +2569,20 @@ def queue_dashboard_enabled(args: argparse.Namespace, total_jobs: int) -> bool:
     return use_rich and sys.stdin.isatty() and sys.stdout.isatty()
 
 
+def is_queue_retryable_error(error_text: str) -> bool:
+    lowered = error_text.lower()
+    non_retryable_markers = (
+        "requires interactive terminal input",
+        "missing required command",
+        "unsupported input type",
+        "input path does not exist",
+        "pronunciation file does not exist",
+        "cover image does not exist",
+        "--input-kind=pdf cannot be used with .txt input",
+    )
+    return not any(marker in lowered for marker in non_retryable_markers)
+
+
 def build_queue_dashboard_view(
     *,
     mode_label: str,
@@ -2495,6 +2661,7 @@ def run_job_queue(
             "status": "queued",
             "attempts": 0,
             "error": "",
+            "retryable": True,
         }
         for job in queue_jobs
     ]
@@ -2558,7 +2725,10 @@ def run_job_queue(
             error_text = str(holder["error"])
             state["status"] = "failed"
             state["error"] = error_text
+            state["retryable"] = is_queue_retryable_error(error_text)
             failure_map[idx] = (queue_jobs[idx].target, error_text)
+            if not state["retryable"]:
+                events.append(f"Non-retryable failure for {queue_jobs[idx].label}; skipping retry pass.")
             events.append(f"Failed {queue_jobs[idx].label}: {error_text}")
             return
 
@@ -2610,7 +2780,11 @@ def run_job_queue(
                     run_one(idx)
 
                 if not cancelled and retry_armed:
-                    retry_indices = [idx for idx, item in enumerate(states) if item.get("status") == "failed"]
+                    retry_indices = [
+                        idx
+                        for idx, item in enumerate(states)
+                        if item.get("status") == "failed" and bool(item.get("retryable", True))
+                    ]
                     if retry_indices:
                         pass_index = 2
                         events.append(f"Retry pass starting for {len(retry_indices)} failed job(s).")
@@ -2643,7 +2817,11 @@ def run_job_queue(
             run_one(idx)
 
         if retry_armed:
-            retry_indices = [idx for idx, item in enumerate(states) if item.get("status") == "failed"]
+            retry_indices = [
+                idx
+                for idx, item in enumerate(states)
+                if item.get("status") == "failed" and bool(item.get("retryable", True))
+            ]
             if retry_indices:
                 print(f"\nRetry pass for failed jobs: {len(retry_indices)}")
                 pass_index = 2
@@ -2675,6 +2853,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Input file or directory (default from config or input)",
+    )
+    parser.add_argument(
+        "--input-kind",
+        choices=("auto", "clean-txt", "raw-txt", "pdf"),
+        default=None,
+        help="Interpretation hint for input text quality (auto-detect by default)",
     )
     parser.add_argument(
         "--work-dir",

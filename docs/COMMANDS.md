@@ -22,7 +22,7 @@ pip install .
 ```
 
 Expected result:
-- `t2s` and `t2s-make` commands are available in the active shell.
+- `t2s` command is available in the active shell.
 
 ### Install optional developer tools (tests + lint)
 
@@ -68,6 +68,7 @@ Use this for one-off conversion or debugging a single document.
 ```bash
 t2s --input input/book.pdf
 t2s --input input/book.txt
+t2s --input input/book.txt --input-kind clean-txt
 ```
 
 Expected result:
@@ -322,37 +323,37 @@ t2s --no-deps-check
 Expected result:
 - startup checks missing tools/packages and can offer guided install.
 
-## 12) Direct Text-To-Speech Command (`t2s-make`)
+## 12) Clean TXT Shortcut
 
-Use `t2s-make` if your `.txt` is already extracted and cleaned.
+Use this when your `.txt` is already extracted and cleaned.
 
 ### Standard run
 
 ```bash
-t2s-make --input /path/to/book.txt --output-dir out_mp3
-t2s-make --input /path/to/book.txt --use-ssml
-t2s-make --input /path/to/book.txt --ui rich --dashboard
-t2s-make --input /path/to/book.txt --max-chars-per-run 500000 --max-cost-usd 10
-t2s-make --input /path/to/book.txt --confirm-before-spend
-t2s-make --input /path/to/book.txt --pronunciation-file pronunciation.toml
-t2s-make --input /path/to/book.txt --acronym-mode list --acronym-include API,PDF
-t2s-make --input /path/to/book.txt --chunk-cache --cache-dir work/cache
-t2s-make --input /path/to/book.txt --workers 4 --rate-limit-rps 15
-t2s-make --input /path/to/book.txt --retry-attempts 6 --retry-base-delay 1.0
+t2s --input /path/to/book.txt --input-kind clean-txt
+t2s --input /path/to/book.txt --input-kind clean-txt --use-ssml
+t2s --input /path/to/book.txt --input-kind clean-txt --ui rich --dashboard
+t2s --input /path/to/book.txt --input-kind clean-txt --max-chars-per-run 500000 --max-cost-usd 10
+t2s --input /path/to/book.txt --input-kind clean-txt --confirm-before-spend
+t2s --input /path/to/book.txt --input-kind clean-txt --pronunciation-file pronunciation.toml
+t2s --input /path/to/book.txt --input-kind clean-txt --acronym-mode list --acronym-include API,PDF
+t2s --input /path/to/book.txt --input-kind clean-txt --chunk-cache --cache-dir work/cache
+t2s --input /path/to/book.txt --input-kind clean-txt --workers 4 --rate-limit-rps 15
+t2s --input /path/to/book.txt --input-kind clean-txt --retry-attempts 6 --retry-base-delay 1.0
 ```
 
 ### Estimate only
 
 ```bash
-t2s-make --input /path/to/book.txt --estimate-only --ui rich
+t2s --input /path/to/book.txt --input-kind clean-txt --estimate-only --ui rich
 ```
 
 ### Fake test run
 
 ```bash
-t2s-make --input /path/to/book.txt --test-run --ui rich
-t2s-make --input /path/to/book.txt --test-run --test-delay 0.005
-t2s-make --input /path/to/book.txt --test-run --test-write-placeholders
+t2s --input /path/to/book.txt --input-kind clean-txt --test-run --ui rich
+t2s --input /path/to/book.txt --input-kind clean-txt --test-run --test-delay 0.005
+t2s --input /path/to/book.txt --input-kind clean-txt --test-run --test-write-placeholders
 ```
 
 ## 13) Reports, Help, And Maintenance
@@ -362,7 +363,6 @@ t2s-make --input /path/to/book.txt --test-run --test-write-placeholders
 ```bash
 t2s --help
 t2s --version
-t2s-make --help
 ```
 
 ### Report files

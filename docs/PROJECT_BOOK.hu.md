@@ -252,12 +252,12 @@ Analytics mezok:
 - failures
 - cache hit rate
 
-## 13. Fejezet: Mikor hasznald a `t2s-make` parancsot?
+## 13. Fejezet: Mikor hasznald az `--input-kind clean-txt` opciot?
 
 Ha mar kesz a tiszta TXT, hasznald ezt:
 
 ```bash
-t2s-make --input /path/to/book.txt --output-dir out_mp3 --ui rich --dashboard
+t2s --input /path/to/book.txt --input-kind clean-txt --ui rich --dashboard
 ```
 
 Jo erre:

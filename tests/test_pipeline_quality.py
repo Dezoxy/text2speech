@@ -41,6 +41,39 @@ def test_write_cleanup_diff_preview_truncates(tmp_path: Path) -> None:
     assert "... truncated " in text
 
 
+def test_classify_txt_input_auto_detects_clean_text() -> None:
+    raw = "Chapter 1\n\nThis is already clean text.\n"
+    cleaned = raw
+
+    decision = pipeline.classify_txt_input(raw, cleaned, requested_kind="auto")
+    assert decision.kind == "clean-txt"
+    assert decision.reason == "auto-identical-after-cleanup"
+    assert decision.identical is True
+
+
+def test_classify_txt_input_forced_modes() -> None:
+    raw = "Raw text [12]"
+    cleaned = "Raw text"
+
+    forced_clean = pipeline.classify_txt_input(raw, cleaned, requested_kind="clean-txt")
+    forced_raw = pipeline.classify_txt_input(raw, cleaned, requested_kind="raw-txt")
+
+    assert forced_clean.kind == "clean-txt"
+    assert forced_clean.reason == "forced-clean-txt"
+    assert forced_raw.kind == "raw-txt"
+    assert forced_raw.reason == "forced-raw-txt"
+
+
+def test_classify_txt_input_auto_whitespace_only_diff_skips_clean() -> None:
+    raw = "Line one.\n\nLine   two.\n"
+    cleaned = "Line one.\n\nLine two.\n"
+
+    decision = pipeline.classify_txt_input(raw, cleaned, requested_kind="auto")
+    assert decision.kind == "clean-txt"
+    assert decision.reason == "auto-whitespace-only-diff"
+    assert decision.whitespace_only_change is True
+
+
 def test_pipeline_test_run_cli_writes_diff_preview(tmp_path: Path) -> None:
     input_txt = tmp_path / "sample.txt"
     input_txt.write_text("CHAPTER 1\n\nhello world.[12]\n")
@@ -83,6 +116,51 @@ def test_pipeline_test_run_cli_writes_diff_preview(tmp_path: Path) -> None:
     preview_meta = clean_step["cleanup_diff_preview"]
     assert clean_step["cleanup_diff_preview_enabled"] is True
     assert Path(preview_meta["path"]).exists()
+
+
+def test_pipeline_forced_clean_txt_skips_cleanup(tmp_path: Path) -> None:
+    input_txt = tmp_path / "clean_sample.txt"
+    input_txt.write_text("Chapter 1\n\nAlready-clean sample text.\n")
+    work_dir = tmp_path / "work"
+    out_dir = tmp_path / "out"
+    cache_dir = tmp_path / "cache"
+    repo_root = Path(__file__).resolve().parents[1]
+    config_path = repo_root / "config.toml"
+
+    raw_args = pipeline.build_parser().parse_args(
+        [
+            "--config",
+            str(config_path),
+            "--input",
+            str(input_txt),
+            "--input-kind",
+            "clean-txt",
+            "--work-dir",
+            str(work_dir),
+            "--out-dir",
+            str(out_dir),
+            "--cache-dir",
+            str(cache_dir),
+            "--test-run",
+            "--ui",
+            "plain",
+            "--no-deps-check",
+        ]
+    )
+    args = pipeline.resolve_runtime_args(raw_args, pipeline.load_config(config_path))
+    result = pipeline.process_single_input_new_job(
+        args=args,
+        input_path=input_txt,
+        work_tmp_root=work_dir / "tmp",
+        out_dir=out_dir,
+        output_stem="clean-sample",
+    )
+
+    manifest = json.loads((Path(result["tmp_dir"]) / "job_manifest.json").read_text())
+    clean_step = manifest["steps"]["clean"]
+    assert clean_step["status"] == "skipped"
+    assert clean_step["reason"] == "forced-clean-txt"
+    assert clean_step["tts_input_txt"].endswith("/raw.txt")
 
 
 def test_run_job_queue_retries_failed_job_once(tmp_path: Path) -> None:
@@ -156,6 +234,38 @@ def test_run_job_queue_reports_failure_without_retry(tmp_path: Path) -> None:
     assert records == []
     assert len(failures) == 1
     assert failures[0][0] == "job-b"
+
+
+def test_run_job_queue_skips_retry_for_non_retryable_error(tmp_path: Path) -> None:
+    calls = {"count": 0}
+
+    def always_fail_non_retryable() -> tuple[Path, dict[str, object]]:
+        calls["count"] += 1
+        raise RuntimeError("confirm-before-spend requires interactive terminal input.")
+
+    args = pipeline.argparse.Namespace(
+        dashboard=False,
+        ui="plain",
+        retry_failed_jobs=True,
+    )
+    jobs = [
+        pipeline.QueueJob(
+            label="job-c",
+            target="job-c",
+            run=always_fail_non_retryable,
+        )
+    ]
+
+    records, failures = pipeline.run_job_queue(
+        args=args,
+        mode_label="batch",
+        queue_jobs=jobs,
+    )
+
+    assert calls["count"] == 1
+    assert records == []
+    assert len(failures) == 1
+    assert failures[0][0] == "job-c"
 
 
 def test_build_run_analytics_sums_tts_metrics(tmp_path: Path) -> None:

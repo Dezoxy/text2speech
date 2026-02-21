@@ -44,6 +44,7 @@ class PronunciationSettings:
 
 @dataclass(frozen=True)
 class PipelineRuntimeConfig:
+    input_kind: str
     lang: str
     voice_name: str
     max_chars: int
@@ -85,6 +86,8 @@ class PipelineRuntimeConfig:
 
     @classmethod
     def from_namespace(cls, args: Any) -> "PipelineRuntimeConfig":
+        if args.input_kind not in {"auto", "clean-txt", "raw-txt", "pdf"}:
+            raise ValueError("--input-kind must be one of: auto, clean-txt, raw-txt, pdf")
         if args.acronym_min_len < 1:
             raise ValueError("--acronym-min-len must be >= 1")
         if args.acronym_max_len < args.acronym_min_len:
@@ -112,6 +115,7 @@ class PipelineRuntimeConfig:
         validate_cost_limit(args.max_cost_usd)
 
         return cls(
+            input_kind=args.input_kind,
             lang=args.lang,
             voice_name=args.voice_name,
             max_chars=args.max_chars,

@@ -24,7 +24,7 @@ Defaults are loaded from `config.toml`.
 Main sections:
 
 - `[paths]`: `input`, `work_dir`, `out_dir`, `cache_dir`
-- `[pipeline]`: `voice_profile`, `ocr`, `ocr_lang`, `ocr_page_min_chars`, `ocr_page_min_alpha_ratio`, `ocr_page_max_replacement_ratio`, `ocr_page_min_score`, `ocr_auto_bad_page_ratio`, `lang`, `voice_name`, `max_chars`, `speaking_rate`, `pitch`, `ui`, `use_ssml`, `cleanup_diff_preview`, `cleanup_diff_max_lines`, `dashboard`, `export_m4b`, `chunk_cache`, `workers`, `rate_limit_rps`, `retry_failed_chunks`, `retry_failed_jobs`
+- `[pipeline]`: `voice_profile`, `input_kind`, `ocr`, `ocr_lang`, `ocr_page_min_chars`, `ocr_page_min_alpha_ratio`, `ocr_page_max_replacement_ratio`, `ocr_page_min_score`, `ocr_auto_bad_page_ratio`, `lang`, `voice_name`, `max_chars`, `speaking_rate`, `pitch`, `ui`, `use_ssml`, `cleanup_diff_preview`, `cleanup_diff_max_lines`, `dashboard`, `export_m4b`, `chunk_cache`, `workers`, `rate_limit_rps`, `retry_failed_chunks`, `retry_failed_jobs`
 - `[voice_profiles]`: presets like `academic`, `novel`, `scan-heavy`
 - `[pronunciation]`: dictionary aliases for names/terms
 - `[ssml_rules]`: acronym spell-out behavior (`off|auto|list`)
@@ -43,8 +43,7 @@ CLI args always override config values.
 
 ## What This Repo Contains
 
-- `pipeline.py`: End-to-end flow (`input -> OCR/extract -> cleanup -> TTS -> out/*.mp3`).
-- `make_mp3.py`: Direct TTS chunk generator for already prepared `.txt` files.
+- `launcher.py`: root launcher for end-to-end flow (`input -> OCR/extract -> cleanup -> TTS -> out/*.mp3`).
 - `dependencies.toml`: dependency manifest used by startup precheck/installer.
 - `docs/QUICKSTART.md`: one-page quick start.
 - `docs/PROJECT_BOOK.md`: beginner-friendly walkthrough.
@@ -80,14 +79,12 @@ Then use:
 ```bash
 t2s --help
 t2s --version
-t2s-make --help
 ```
 
 Direct script mode is still supported:
 
 ```bash
-python3 pipeline.py --help
-python3 make_mp3.py --help
+python3 launcher.py --help
 ```
 
 
@@ -101,7 +98,7 @@ For contributors, the module map and refactor workflow are documented in:
 This includes:
 
 - package module ownership (`pipeline_app`, `make_mp3_app`, `shared/*`)
-- backward-compatible wrapper expectations
+- single launcher entrypoint expectations (`launcher.py`)
 - required lint/test/smoke validation commands
 
 Install local command-line tools used by the pipeline:
@@ -130,6 +127,7 @@ This processes all supported files in `input/` (`.pdf`, `.txt`), stores tmp arti
 Useful options:
 
 - `--input /path/to/file-or-folder`
+- `--input-kind auto|clean-txt|raw-txt|pdf`
 - `--work-dir work`
 - `--out-dir out`
 - `--ocr auto|always|never`
@@ -183,7 +181,7 @@ Useful options:
 
 ## Dependency Precheck
 
-At startup, `t2s` and `t2s-make` read `dependencies.toml`, check installed dependencies, and show exactly what is missing.
+At startup, `t2s` reads `dependencies.toml`, checks installed dependencies, and shows exactly what is missing.
 
 If there are missing items and auto-install is enabled, it asks for your confirmation before installing anything.
 If required Python dependencies already exist in local `.venv`, the app auto-relaunches with `.venv/bin/python`.
@@ -198,21 +196,19 @@ Example:
 
 ```bash
 t2s
-t2s-make --input /path/to/book.txt
+t2s --input /path/to/book.txt --input-kind clean-txt
 ```
 
 Check-only mode (no installer prompt):
 
 ```bash
 t2s --no-deps-auto-install
-t2s-make --input /path/to/book.txt --no-deps-auto-install
 ```
 
 Skip startup dependency precheck:
 
 ```bash
 t2s --no-deps-check
-t2s-make --input /path/to/book.txt --no-deps-check
 ```
 
 ## Audio Quality + Chapters
@@ -265,8 +261,6 @@ Explicit confirm gate before paid synthesis:
 ```bash
 t2s --confirm-before-spend
 ```
-
-The same controls are available in `t2s-make`.
 
 ## Performance + Reliability
 
@@ -368,12 +362,12 @@ Lint:
 ruff check .
 ```
 
-## Direct TTS Script (Prepared TXT Input)
+## Clean TXT Shortcut
 
-If you already have a clean text file:
+If your `.txt` is already clean, run:
 
 ```bash
-t2s-make --input /path/to/book.txt --output-dir out_mp3
+t2s --input /path/to/book.txt --input-kind clean-txt
 ```
 
 ## Notes

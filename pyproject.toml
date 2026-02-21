@@ -21,8 +21,7 @@ dev = [
 
 [project.scripts]
 t2s = "text2speech.pipeline_app:main"
-t2s-make = "text2speech.make_mp3_app:main"
 
 [tool.setuptools]
 packages = ["text2speech"]
-py-modules = ["pipeline", "make_mp3", "text2speech_version"]
+py-modules = ["launcher", "text2speech_version"]

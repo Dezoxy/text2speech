@@ -1,4 +1,4 @@
-# Optional external pronunciation dictionary for t2s / t2s-make.
+# Optional external pronunciation dictionary for t2s / launcher.py.
 # Use with: --pronunciation-file pronunciation.toml
 
 [aliases]

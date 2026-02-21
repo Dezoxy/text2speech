@@ -107,7 +107,7 @@ Help:
 
 ```bash
 t2s --help
-t2s-make --help
+python3 launcher.py --help
 ```
 
 ## 10) Next Docs

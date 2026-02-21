@@ -4,15 +4,13 @@
 
 No breaking CLI migration is required.
 
-### Still supported (legacy)
+### Root launcher
 
-- `python3 pipeline.py ...`
-- `python3 make_mp3.py ...`
+- `python3 launcher.py ...`
 
 ### Preferred
 
 - `t2s ...`
-- `t2s-make ...`
 
 ## Internal Code Migration
 
