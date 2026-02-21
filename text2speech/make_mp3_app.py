@@ -869,19 +869,18 @@ def break_long_runs(t: str, max_run: int = 420) -> str:
         if len(r) <= max_run:
             return r
 
-        # Prefer adding sentence boundaries at stronger punctuation first.
-        r2 = re.sub(r"([;:,)\]\}])(\s+)", r"\1. \2", r)
-
-        if len(r2) <= max_run:
-            return r2
-
         parts = []
-        s = r2
+        s = r
         while len(s) > max_run:
             cut = s.rfind(" ", 0, max_run)
             if cut < int(max_run * 0.6):
                 cut = max_run
-            parts.append(s[:cut].rstrip() + ".")
+            piece = s[:cut].rstrip()
+            if piece.endswith((",", ";", ":")):
+                piece = piece[:-1].rstrip()
+            if piece and piece[-1] not in ".!?…":
+                piece += "."
+            parts.append(piece)
             s = s[cut:].lstrip()
         if s:
             parts.append(s)
@@ -941,6 +940,56 @@ def is_chapter_heading(paragraph: str) -> bool:
     return False
 
 
+def is_figure_caption_paragraph(paragraph: str) -> bool:
+    p = re.sub(r"\s+", " ", paragraph).strip().lower()
+    if not p:
+        return False
+    if p.startswith("ábrajegyzék"):
+        return True
+    match = re.search(r"\b(?:ábra|figure)\s*\d{1,3}\s*(?:[.:-]|$)", p)
+    return bool(match and match.start() <= 40)
+
+
+def is_reference_paragraph(paragraph: str) -> bool:
+    p = re.sub(r"\s+", " ", paragraph).strip()
+    if not p:
+        return False
+    lower = p.lower()
+    if re.search(r"https?://\S+|www\.\S+", lower):
+        return True
+    if lower.startswith(
+        (
+            "what is amazon ",
+            "overview of amazon ",
+            "announcing amazon ",
+            "new for aws ",
+            "new - aws ",
+            "new – aws ",
+        )
+    ):
+        return True
+    if "aws news blog" in lower:
+        return True
+    if "|" in p and "aws" in lower and "blog" in lower:
+        return True
+    if " - amazon " in lower and len(p) <= 260 and lower.count(" - ") >= 1:
+        letters = sum(1 for ch in p if ch.isalpha())
+        if letters >= 25:
+            return True
+    return False
+
+
+def is_shouting_teaser_paragraph(paragraph: str) -> bool:
+    p = re.sub(r"\s+", " ", paragraph).strip()
+    letters = [ch for ch in p if ch.isalpha()]
+    if len(letters) < 60:
+        return False
+    if len(p.split()) < 10:
+        return False
+    upper_ratio = sum(1 for ch in letters if ch.isupper()) / len(letters)
+    return upper_ratio >= 0.92
+
+
 def clean_text(t: str) -> str:
     t = t.replace("\u00ad", "")  # soft hyphen
     t = re.sub(r"(\w)-\n(\w)", r"\1\2", t)  # fix hyphenation across lines
@@ -952,6 +1001,30 @@ def clean_text(t: str) -> str:
     # Keep paragraph structure for chapter detection.
     t = re.sub(r"\r\n?", "\n", t)
     t = re.sub(r"(?<!\n)\n(?!\n)", " ", t)
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = t.strip()
+
+    paragraphs = split_paragraphs(t)
+    filtered_paragraphs = [
+        p
+        for p in paragraphs
+        if not is_figure_caption_paragraph(p)
+        and not is_reference_paragraph(p)
+        and not is_shouting_teaser_paragraph(p)
+    ]
+    t = "\n\n".join(filtered_paragraphs).strip()
+
+    # Remove frequent OCR punctuation artifacts.
+    t = re.sub(r"\.\s*,", ",", t)
+    t = re.sub(r",\s*\.", ",", t)
+    t = re.sub(r",\s*\.+", ",", t)
+    t = re.sub(r"\.\s*\.+", ".", t)
+    t = re.sub(r"\.\s*:", ":", t)
+    t = re.sub(r":\s*\.", ":", t)
+    t = re.sub(r"\(\s+", "(", t)
+    t = re.sub(r"\s+\)", ")", t)
+    t = re.sub(r"(?<=[\):])\s*\d{1,2}\s+(?=[A-ZÁÉÍÓÖŐÚÜŰ])", " ", t)
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     t = t.strip()

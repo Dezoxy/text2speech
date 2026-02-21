@@ -1078,6 +1078,35 @@ def looks_like_noise_line(line: str) -> bool:
     if any(re.match(p, lower) for p in patterns):
         return True
 
+    if lower.startswith("ábrajegyzék"):
+        return True
+
+    figure_match = re.search(r"\b(?:ábra|figure)\s*\d{1,3}\s*(?:[.:-]|$)", lower)
+    if figure_match and figure_match.start() <= 40:
+        return True
+
+    reference_starts = (
+        "what is amazon ",
+        "overview of amazon ",
+        "announcing amazon ",
+        "new for aws ",
+        "new - aws ",
+        "new – aws ",
+    )
+    if lower.startswith(reference_starts):
+        return True
+    if "aws news blog" in lower:
+        return True
+    if "|" in s and "aws" in lower and "blog" in lower:
+        return True
+
+    # Common imported source-title lines from PDFs:
+    # "Predictive scaling for Amazon ... - Amazon ..."
+    if " - amazon " in lower and len(s) <= 260 and lower.count(" - ") >= 1:
+        letters = sum(1 for ch in s if ch.isalpha())
+        if letters >= 25:
+            return True
+
     if len(s) <= 3 and all(ch in "*-_~" for ch in s):
         return True
 

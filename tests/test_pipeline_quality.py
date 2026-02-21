@@ -77,6 +77,26 @@ def test_classify_txt_input_auto_whitespace_only_diff_skips_clean() -> None:
     assert decision.whitespace_only_change is True
 
 
+def test_clean_for_audiobook_drops_figure_and_source_reference_lines() -> None:
+    raw = (
+        "Ez egy hasznos bekezdes.\n"
+        "ábra 2 - Valami illusztracio.\n"
+        "What is Amazon EC2 Auto Scaling?\n"
+        "Predictive scaling for Amazon EC2 Auto Scaling - Amazon EC2 Auto Scaling\n"
+        "New for AWS Lambda – Container Image Support | AWS News Blog\n"
+        "Ez maradjon benne.\n"
+    )
+
+    cleaned = pipeline.clean_for_audiobook(raw)
+
+    assert "ábra 2" not in cleaned
+    assert "What is Amazon EC2 Auto Scaling?" not in cleaned
+    assert "Predictive scaling for Amazon EC2 Auto Scaling" not in cleaned
+    assert "AWS News Blog" not in cleaned
+    assert "Ez egy hasznos bekezdes." in cleaned
+    assert "Ez maradjon benne." in cleaned
+
+
 def test_validate_input_kind_for_path_rejects_pdf_mode_for_txt() -> None:
     with pytest.raises(RuntimeError, match="--input-kind=pdf can only be used with PDF input"):
         pipeline.validate_input_kind_for_path("pdf", Path("book.txt"))

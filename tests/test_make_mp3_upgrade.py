@@ -259,6 +259,40 @@ def test_non_chirp_voice_keeps_pitch_in_audio_config(tmp_path: Path, monkeypatch
     assert captured_kwargs[0]["pitch"] == -1.0
 
 
+def test_clean_text_filters_pdf_reference_artifacts() -> None:
+    raw = (
+        "Tartalomjegyzék\n\n"
+        "AZ AMAZON S3 TABLES EGY UJ SZOLGALTATAS, AMELY NAGYBETUS TEASERKENT KERULT IDE.\n\n"
+        "Bevezeto szoveg maradjon.\n\n"
+        "ábra 3- Pelda abra felirat.\n\n"
+        "What is Amazon EC2 Auto Scaling?\n\n"
+        "Predictive scaling for Amazon EC2 Auto Scaling - Amazon EC2 Auto Scaling\n\n"
+        "New for AWS Lambda – Container Image Support | AWS News Blog\n\n"
+        "Masik hasznos bekezdes."
+    )
+
+    cleaned = make_mp3.clean_text(raw)
+
+    assert "AZ AMAZON S3 TABLES" not in cleaned
+    assert "ábra 3" not in cleaned
+    assert "What is Amazon EC2 Auto Scaling?" not in cleaned
+    assert "Predictive scaling for Amazon EC2 Auto Scaling" not in cleaned
+    assert "AWS News Blog" not in cleaned
+    assert "Bevezeto szoveg maradjon." in cleaned
+    assert "Masik hasznos bekezdes." in cleaned
+
+
+def test_clean_text_normalizes_common_ocr_punctuation_noise() -> None:
+    raw = "Andy Jassy,. ezt mondta,. pelda. : es I. On-Demand: 3 Rugalmas."
+
+    cleaned = make_mp3.clean_text(raw)
+
+    assert ",." not in cleaned
+    assert ". :" not in cleaned
+    assert ": 3 Rugalmas" not in cleaned
+    assert "On-Demand: Rugalmas" in cleaned
+
+
 def test_shape_ssml_text_applies_aliases_and_acronym_rules() -> None:
     ssml = make_mp3.shape_ssml_text(
         "ChatGPT with API and NASA.",
