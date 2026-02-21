@@ -184,6 +184,7 @@ def test_pipeline_test_run_cli_writes_diff_preview(tmp_path: Path) -> None:
             "--test-run",
             "--ui",
             "plain",
+            "--no-review-before-tts",
             "--no-deps-check",
         ]
     )
@@ -229,6 +230,7 @@ def test_pipeline_forced_clean_txt_skips_cleanup(tmp_path: Path) -> None:
             "--test-run",
             "--ui",
             "plain",
+            "--no-review-before-tts",
             "--no-deps-check",
         ]
     )

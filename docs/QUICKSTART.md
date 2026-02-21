@@ -4,10 +4,27 @@ Fastest path from zero to first audiobook.
 
 ## 1) Install
 
+Global install (no venv activation needed):
+
+```bash
+brew install pipx
+pipx ensurepath --force
+exec zsh
+pipx install --force /Users/horvathtoom/Documents/github/text2speech
+```
+
+Alternative local venv install:
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install .
+brew install poppler ocrmypdf tesseract ffmpeg
+```
+
+If you used the global `pipx` install, install system binaries once:
+
+```bash
 brew install poppler ocrmypdf tesseract ffmpeg
 ```
 

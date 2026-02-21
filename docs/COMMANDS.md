@@ -11,6 +11,26 @@ If you want a full walkthrough, read `docs/PROJECT_BOOK.md` first.
 
 ## 1) Install And First Check
 
+### Global install with pipx (no venv activation)
+
+Use this for normal terminal usage where `t2s` should work without `source .venv/bin/activate`.
+
+```bash
+brew install pipx
+pipx ensurepath --force
+exec zsh
+pipx install --force /Users/horvathtoom/Documents/github/text2speech
+```
+
+Expected result:
+- `t2s` is available globally (for example at `~/.local/bin/t2s`).
+
+After local code changes, refresh global CLI:
+
+```bash
+pipx install --force /Users/horvathtoom/Documents/github/text2speech
+```
+
 ### Create local environment and install the app
 
 Use this once when setting up the project on a machine.

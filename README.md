@@ -66,19 +66,34 @@ pip install google-cloud-texttospeech rich
 
 ## Installable CLI
 
-Install the project as a CLI app (recommended):
+Global install (no venv activation needed, recommended for daily use):
+
+```bash
+brew install pipx
+pipx ensurepath --force
+exec zsh
+pipx install --force /Users/horvathtoom/Documents/github/text2speech
+```
+
+Then use from any terminal:
+
+```bash
+t2s --help
+t2s --version
+```
+
+Update global install after local code changes:
+
+```bash
+pipx install --force /Users/horvathtoom/Documents/github/text2speech
+```
+
+Local venv install (useful for development):
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install .
-```
-
-Then use:
-
-```bash
-t2s --help
-t2s --version
 ```
 
 Direct script mode is still supported:
