@@ -32,4 +32,5 @@ book.txt
 *.pdf
 
 # Packaging artifacts
+build/
 *.egg-info/
