@@ -167,6 +167,98 @@ def test_chunk_cache_and_parallel_workers(tmp_path: Path, monkeypatch) -> None:
     assert call_count["value"] == calls_after_first
 
 
+def test_chirp_voice_omits_pitch_from_audio_config(tmp_path: Path, monkeypatch) -> None:
+    input_txt = FIXTURES / "golden_input.txt"
+    captured_kwargs: list[dict[str, object]] = []
+
+    class FakeTTS:
+        class AudioEncoding:
+            MP3 = "MP3"
+
+        class SynthesisInput:
+            def __init__(self, *, text=None, ssml=None):
+                self.text = text
+                self.ssml = ssml
+
+        class VoiceSelectionParams:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class AudioConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class TextToSpeechClient:
+            def synthesize_speech(self, **kwargs):
+                captured_kwargs.append(kwargs["audio_config"].kwargs)
+                return SimpleNamespace(audio_content=b"fake-audio")
+
+    monkeypatch.setattr(make_mp3, "load_google_tts", lambda: FakeTTS)
+
+    summary = make_mp3.run_tts(
+        input_txt=input_txt,
+        out_dir=tmp_path / "out-chirp",
+        lang="hu-HU",
+        voice_name="hu-HU-Chirp3-HD-Erinome",
+        max_chars=500,
+        speaking_rate=1.0,
+        pitch=-1.0,
+        ui_mode="plain",
+        use_ssml=True,
+        retry_attempts=1,
+    )
+
+    assert summary["generated"] > 0
+    assert captured_kwargs
+    assert "pitch" not in captured_kwargs[0]
+
+
+def test_non_chirp_voice_keeps_pitch_in_audio_config(tmp_path: Path, monkeypatch) -> None:
+    input_txt = FIXTURES / "golden_input.txt"
+    captured_kwargs: list[dict[str, object]] = []
+
+    class FakeTTS:
+        class AudioEncoding:
+            MP3 = "MP3"
+
+        class SynthesisInput:
+            def __init__(self, *, text=None, ssml=None):
+                self.text = text
+                self.ssml = ssml
+
+        class VoiceSelectionParams:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class AudioConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class TextToSpeechClient:
+            def synthesize_speech(self, **kwargs):
+                captured_kwargs.append(kwargs["audio_config"].kwargs)
+                return SimpleNamespace(audio_content=b"fake-audio")
+
+    monkeypatch.setattr(make_mp3, "load_google_tts", lambda: FakeTTS)
+
+    summary = make_mp3.run_tts(
+        input_txt=input_txt,
+        out_dir=tmp_path / "out-wavenet",
+        lang="hu-HU",
+        voice_name="hu-HU-Wavenet-B",
+        max_chars=500,
+        speaking_rate=1.0,
+        pitch=-1.0,
+        ui_mode="plain",
+        use_ssml=True,
+        retry_attempts=1,
+    )
+
+    assert summary["generated"] > 0
+    assert captured_kwargs
+    assert captured_kwargs[0]["pitch"] == -1.0
+
+
 def test_shape_ssml_text_applies_aliases_and_acronym_rules() -> None:
     ssml = make_mp3.shape_ssml_text(
         "ChatGPT with API and NASA.",

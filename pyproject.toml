@@ -23,5 +23,7 @@ dev = [
 t2s = "text2speech.pipeline_app:main"
 
 [tool.setuptools]
-packages = ["text2speech"]
 py-modules = ["launcher", "text2speech_version"]
+
+[tool.setuptools.packages.find]
+include = ["text2speech*"]

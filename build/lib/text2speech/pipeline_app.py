@@ -134,6 +134,25 @@ class TxtInputClassification:
     cleaned_quality: dict[str, Any]
 
 
+class PipelineReliabilityError(RuntimeError):
+    retryable = False
+
+
+class NonRetryableConfigError(PipelineReliabilityError):
+    retryable = False
+
+
+class RetryableTransientError(PipelineReliabilityError):
+    retryable = True
+
+
+def classify_exception_retryable(exc: BaseException) -> bool:
+    retryable = getattr(exc, "retryable", None)
+    if isinstance(retryable, bool):
+        return retryable
+    return is_queue_retryable_error(str(exc))
+
+
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -884,6 +903,14 @@ def classify_txt_input(raw_text: str, cleaned_text: str, *, requested_kind: str)
     )
 
 
+def validate_input_kind_for_path(input_kind: str, input_path: Path) -> None:
+    suffix = input_path.suffix.lower()
+    if suffix == ".txt" and input_kind == "pdf":
+        raise NonRetryableConfigError("--input-kind=pdf can only be used with PDF input")
+    if suffix == ".pdf" and input_kind in {"clean-txt", "raw-txt"}:
+        raise NonRetryableConfigError(f"--input-kind={input_kind} can only be used with TXT input")
+
+
 def build_ocr_quality_thresholds(args: argparse.Namespace) -> OcrQualityThresholds:
     return OcrQualityThresholds(
         page_min_chars=int(args.ocr_page_min_chars),
@@ -1167,8 +1194,9 @@ def set_manifest_status(
     manifest: dict[str, Any],
     status: str,
     error: str | None = None,
+    retryable: bool | None = None,
 ) -> None:
-    shared_set_manifest_status(manifest_path, manifest, status, error=error)
+    shared_set_manifest_status(manifest_path, manifest, status, error=error, retryable=retryable)
 
 
 def set_step(
@@ -1697,6 +1725,9 @@ def write_run_report(
         "test_run": bool(args.test_run),
         "estimate_only": bool(args.estimate_only),
         "watch": bool(getattr(args, "watch", False)),
+        "watch_failure_limit": int(args.watch_failure_limit),
+        "watch_failure_window_seconds": float(args.watch_failure_window_seconds),
+        "reliable_mode": bool(getattr(args, "reliable_mode", False)),
         "input_kind": str(args.input_kind),
         "ocr": str(args.ocr),
         "ocr_lang": str(args.ocr_lang),
@@ -1932,6 +1963,7 @@ def run_job(
     raw_txt = job_tmp_dir / "raw.txt"
     raw_input_txt = job_tmp_dir / "raw_input.txt"
     runtime_cfg = PipelineRuntimeConfig.from_namespace(args)
+    validate_input_kind_for_path(runtime_cfg.input_kind, input_path)
 
     clean_txt = job_tmp_dir / "clean_for_tts.txt"
     clean_diff_preview_txt = job_tmp_dir / "clean_diff_preview.patch"
@@ -2020,9 +2052,6 @@ def run_job(
             set_step(manifest_path, manifest, "clean", "in_progress")
             raw_text = raw_txt.read_text(errors="ignore")
             if input_path.suffix.lower() == ".txt":
-                if runtime_cfg.input_kind == "pdf":
-                    raise RuntimeError("--input-kind=pdf cannot be used with .txt input")
-
                 cleaned = clean_for_audiobook(raw_text)
                 txt_classification = classify_txt_input(
                     raw_text,
@@ -2302,6 +2331,7 @@ def run_job(
         return manifest
 
     except Exception as exc:  # noqa: BLE001
+        retryable = classify_exception_retryable(exc)
         if current_step is not None and step_status(manifest, current_step) not in {
             "completed",
             "skipped",
@@ -2312,8 +2342,9 @@ def run_job(
                 current_step,
                 "failed",
                 error=str(exc),
+                retryable=retryable,
             )
-        set_manifest_status(manifest_path, manifest, "failed", error=str(exc))
+        set_manifest_status(manifest_path, manifest, "failed", error=str(exc), retryable=retryable)
         raise
 
 
@@ -2378,7 +2409,7 @@ def discover_resumable_manifests(work_tmp_root: Path) -> list[Path]:
         return []
 
     candidates = sorted(work_tmp_root.glob("*/job_manifest.json"), key=lambda p: p.stat().st_mtime)
-    resumable: list[Path] = []
+    latest_by_target: dict[str, tuple[Path, str, bool]] = {}
 
     for manifest_path in candidates:
         try:
@@ -2386,11 +2417,23 @@ def discover_resumable_manifests(work_tmp_root: Path) -> list[Path]:
         except Exception:  # noqa: BLE001
             continue
 
-        status = str(manifest.get("status", "")).lower()
-        if status != "completed":
-            resumable.append(manifest_path)
+        final_out_raw = str(manifest.get("final_output_mp3", "")).strip()
+        if final_out_raw:
+            target_key = f"out:{Path(final_out_raw).expanduser().resolve()}"
+        else:
+            input_raw = str(manifest.get("input", "")).strip()
+            target_key = f"in:{Path(input_raw).expanduser().resolve()}"
 
-    return resumable
+        status = str(manifest.get("status", "")).lower()
+        retryable = manifest.get("retryable", True)
+        latest_by_target[target_key] = (manifest_path, status, bool(retryable))
+
+    resumable = [
+        path
+        for path, status, retryable in latest_by_target.values()
+        if status != "completed" and not (status == "failed" and not retryable)
+    ]
+    return sorted(resumable, key=lambda p: p.stat().st_mtime)
 
 
 def filter_manifests_by_input(
@@ -2472,7 +2515,9 @@ def run_watch_loop(
 
     stable_state: dict[str, dict[str, Any]] = {}
     processed_signatures: dict[str, tuple[int, int]] = {}
-    failed_signatures: dict[str, tuple[int, int]] = {}
+    failure_history: dict[str, list[float]] = {}
+    watch_failure_limit = max(1, int(getattr(args, "watch_failure_limit", 3)))
+    watch_failure_window_seconds = float(getattr(args, "watch_failure_window_seconds", 120.0))
 
     print(
         "Watch mode enabled. "
@@ -2495,23 +2540,37 @@ def run_watch_loop(
                 if key not in active_keys:
                     stable_state.pop(key, None)
                     processed_signatures.pop(key, None)
-                    failed_signatures.pop(key, None)
+            for failure_key in list(failure_history):
+                if failure_key not in active_keys:
+                    failure_history.pop(failure_key, None)
 
             now = time.time()
             ready: list[tuple[Path, tuple[int, int]]] = []
 
             for path in files:
                 key = str(path.resolve())
-                stat = path.stat()
+                try:
+                    stat = path.stat()
+                except OSError:
+                    # File may disappear between directory listing and stat in watch mode.
+                    stable_state.pop(key, None)
+                    processed_signatures.pop(key, None)
+                    continue
                 signature = (int(stat.st_size), int(stat.st_mtime_ns))
                 entry = stable_state.get(key)
+                recent_failures = [
+                    ts
+                    for ts in failure_history.get(key, [])
+                    if now - ts <= watch_failure_window_seconds
+                ]
+                failure_history[key] = recent_failures
 
                 if entry is None or entry.get("signature") != signature:
                     stable_state[key] = {"signature": signature, "since": now}
                     if (
                         args.watch_stable_seconds <= 0
                         and processed_signatures.get(key) != signature
-                        and failed_signatures.get(key) != signature
+                        and len(recent_failures) < watch_failure_limit
                     ):
                         ready.append((path, signature))
                     continue
@@ -2521,7 +2580,7 @@ def run_watch_loop(
                     continue
                 if processed_signatures.get(key) == signature:
                     continue
-                if failed_signatures.get(key) == signature:
+                if len(recent_failures) >= watch_failure_limit:
                     continue
 
                 ready.append((path, signature))
@@ -2543,10 +2602,21 @@ def run_watch_loop(
                     manifest_path = Path(manifest.get("tmp_dir", "")).resolve() / "job_manifest.json"
                     jobs.append(build_job_record(manifest_path, manifest))
                     processed_signatures[key] = signature
-                    failed_signatures.pop(key, None)
                 except Exception as exc:  # noqa: BLE001
                     failures.append((str(path), str(exc)))
-                    failed_signatures[key] = signature
+                    failure_now = time.time()
+                    timestamps = [
+                        ts
+                        for ts in failure_history.get(key, [])
+                        if failure_now - ts <= watch_failure_window_seconds
+                    ]
+                    timestamps.append(failure_now)
+                    failure_history[key] = timestamps
+                    if len(timestamps) >= watch_failure_limit:
+                        print(
+                            f"Watch circuit breaker open for {path}: "
+                            f"{len(timestamps)} failures in {watch_failure_window_seconds:.0f}s"
+                        )
                     print(f"Watch failed {path}: {exc}")
 
             if args.watch_max_cycles > 0 and cycle >= args.watch_max_cycles:
@@ -2567,6 +2637,21 @@ def queue_dashboard_enabled(args: argparse.Namespace, total_jobs: int) -> bool:
         return False
     use_rich = make_mp3.should_use_rich_ui(args.ui)
     return use_rich and sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def is_queue_retryable_error(error_text: str) -> bool:
+    lowered = error_text.lower()
+    non_retryable_markers = (
+        "requires interactive terminal input",
+        "missing required command",
+        "unsupported input type",
+        "input path does not exist",
+        "pronunciation file does not exist",
+        "cover image does not exist",
+        "can only be used with pdf input",
+        "can only be used with txt input",
+    )
+    return not any(marker in lowered for marker in non_retryable_markers)
 
 
 def build_queue_dashboard_view(
@@ -2647,6 +2732,7 @@ def run_job_queue(
             "status": "queued",
             "attempts": 0,
             "error": "",
+            "retryable": True,
         }
         for job in queue_jobs
     ]
@@ -2710,7 +2796,10 @@ def run_job_queue(
             error_text = str(holder["error"])
             state["status"] = "failed"
             state["error"] = error_text
+            state["retryable"] = classify_exception_retryable(holder["error"])
             failure_map[idx] = (queue_jobs[idx].target, error_text)
+            if not state["retryable"]:
+                events.append(f"Non-retryable failure for {queue_jobs[idx].label}; skipping retry pass.")
             events.append(f"Failed {queue_jobs[idx].label}: {error_text}")
             return
 
@@ -2762,7 +2851,11 @@ def run_job_queue(
                     run_one(idx)
 
                 if not cancelled and retry_armed:
-                    retry_indices = [idx for idx, item in enumerate(states) if item.get("status") == "failed"]
+                    retry_indices = [
+                        idx
+                        for idx, item in enumerate(states)
+                        if item.get("status") == "failed" and bool(item.get("retryable", True))
+                    ]
                     if retry_indices:
                         pass_index = 2
                         events.append(f"Retry pass starting for {len(retry_indices)} failed job(s).")
@@ -2795,7 +2888,11 @@ def run_job_queue(
             run_one(idx)
 
         if retry_armed:
-            retry_indices = [idx for idx, item in enumerate(states) if item.get("status") == "failed"]
+            retry_indices = [
+                idx
+                for idx, item in enumerate(states)
+                if item.get("status") == "failed" and bool(item.get("retryable", True))
+            ]
             if retry_indices:
                 print(f"\nRetry pass for failed jobs: {len(retry_indices)}")
                 pass_index = 2
@@ -3127,6 +3224,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Stop watch mode after N scan cycles (0 = run until interrupted)",
     )
+    parser.add_argument(
+        "--watch-failure-limit",
+        type=int,
+        default=3,
+        help="Circuit breaker: max failures per file within watch failure window before temporary suppression",
+    )
+    parser.add_argument(
+        "--watch-failure-window-seconds",
+        type=float,
+        default=120.0,
+        help="Circuit breaker window (seconds) for watch per-file failure suppression",
+    )
+    parser.add_argument(
+        "--reliable-mode",
+        action="store_true",
+        help="Enable strict reliability preset (doctor run, safer watch defaults, retry caps, non-interactive safety)",
+    )
     return parser
 
 
@@ -3145,6 +3259,10 @@ def main() -> None:
         raise SystemExit("--watch-stable-seconds must be >= 0")
     if args.watch_max_cycles < 0:
         raise SystemExit("--watch-max-cycles must be >= 0")
+    if args.watch_failure_limit < 1:
+        raise SystemExit("--watch-failure-limit must be >= 1")
+    if args.watch_failure_window_seconds <= 0:
+        raise SystemExit("--watch-failure-window-seconds must be > 0")
     if args.max_chars_per_run is not None and args.max_chars_per_run <= 0:
         raise SystemExit("--max-chars-per-run must be > 0")
     try:
@@ -3191,6 +3309,18 @@ def main() -> None:
 
     if raw_args.watch and (raw_args.resume or raw_args.resume_job is not None):
         raise SystemExit("Cannot combine --watch with --resume or --resume-job")
+
+    if args.reliable_mode:
+        raw_args.doctor = True
+        args.doctor = True
+        args.retry_failed_jobs = True
+        args.retry_attempts = min(int(args.retry_attempts), 4)
+        args.retry_max_delay = min(float(args.retry_max_delay), 8.0)
+        if args.watch:
+            args.watch_interval = max(float(args.watch_interval), 2.0)
+            args.watch_stable_seconds = max(float(args.watch_stable_seconds), 3.0)
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            args.confirm_before_spend = False
 
     if raw_args.deps_check:
         try:
@@ -3263,13 +3393,15 @@ def main() -> None:
             queue_jobs=queue_jobs,
         )
 
-        write_run_report(
+        report_path = write_run_report(
             work_dir=work_dir,
             mode="resume",
             args=args,
             jobs=job_records,
             failures=failures,
         )
+        if args.reliable_mode:
+            _ = json.loads(report_path.read_text())
 
         if failures:
             print(f"\nCompleted with failures: {len(failures)}/{len(resume_manifests)}")
@@ -3295,13 +3427,15 @@ def main() -> None:
             out_dir=out_dir,
         )
 
-        write_run_report(
+        report_path = write_run_report(
             work_dir=work_dir,
             mode="watch",
             args=args,
             jobs=job_records,
             failures=failures,
         )
+        if args.reliable_mode:
+            _ = json.loads(report_path.read_text())
 
         if failures:
             print(f"\nWatch stopped with failures: {len(failures)}")
@@ -3367,13 +3501,15 @@ def main() -> None:
         queue_jobs=queue_jobs,
     )
 
-    write_run_report(
+    report_path = write_run_report(
         work_dir=work_dir,
         mode="batch",
         args=args,
         jobs=job_records,
         failures=failures,
     )
+    if args.reliable_mode:
+        _ = json.loads(report_path.read_text())
 
     if failures:
         print(f"\nCompleted with failures: {len(failures)}/{len(input_files)}")

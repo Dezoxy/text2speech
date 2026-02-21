@@ -325,6 +325,12 @@ def infer_voice_pricing(voice_name: str) -> VoicePricing:
     return VOICE_PRICING_TABLE["unknown"]
 
 
+def voice_supports_pitch(voice_name: str) -> bool:
+    lower = voice_name.lower()
+    # Chirp 3 voices reject the pitch field in AudioConfig.
+    return "chirp3" not in lower
+
+
 def current_month_key() -> str:
     return datetime.now().strftime("%Y-%m")
 
@@ -1841,11 +1847,16 @@ def run_tts(
         name=voice_name,
     )
 
-    audio_config = texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.MP3,
-        speaking_rate=speaking_rate,
-        pitch=pitch,
-    )
+    audio_config_kwargs: dict[str, Any] = {
+        "audio_encoding": texttospeech.AudioEncoding.MP3,
+        "speaking_rate": speaking_rate,
+    }
+    if voice_supports_pitch(voice_name):
+        audio_config_kwargs["pitch"] = pitch
+    elif abs(pitch) > 1e-9:
+        print(f"Voice {voice_name} ignores --pitch; omitting pitch setting.")
+
+    audio_config = texttospeech.AudioConfig(**audio_config_kwargs)
 
     rate_limiter = RateLimiter(rate_limit_rps)
     failures: list[tuple[str, str]] = []
