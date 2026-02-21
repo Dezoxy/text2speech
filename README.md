@@ -175,6 +175,8 @@ Useful options:
 - `--confirm-before-spend` / `--no-confirm-before-spend`
 - `--doctor` / `--doctor-only`
 - `--watch --watch-interval 5 --watch-stable-seconds 3`
+- `--watch-failure-limit 3 --watch-failure-window-seconds 120`
+- `--reliable-mode`
 - `--deps-file dependencies.toml`
 - `--deps-check` / `--no-deps-check`
 - `--deps-auto-install` / `--no-deps-auto-install`
@@ -332,6 +334,12 @@ Useful watch flags:
 - `--watch-interval 5` (scan every 5 seconds)
 - `--watch-stable-seconds 3` (file must be unchanged for 3 seconds before processing)
 - `--watch-max-cycles 20` (for testing; `0` means run until interrupted)
+- `--watch-failure-limit 3` (per-file circuit breaker threshold)
+- `--watch-failure-window-seconds 120` (circuit breaker window)
+
+Strict reliability preset:
+
+- `--reliable-mode` enables `--doctor`, caps retry aggressiveness, applies safer watch defaults, disables `--confirm-before-spend` in non-interactive terminals, and validates written run reports.
 
 ## Run Reports
 
