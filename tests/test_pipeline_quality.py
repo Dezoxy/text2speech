@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+
+import pytest
 
 from text2speech import pipeline_app as pipeline
 
@@ -72,6 +75,26 @@ def test_classify_txt_input_auto_whitespace_only_diff_skips_clean() -> None:
     assert decision.kind == "clean-txt"
     assert decision.reason == "auto-whitespace-only-diff"
     assert decision.whitespace_only_change is True
+
+
+def test_validate_input_kind_for_path_rejects_pdf_mode_for_txt() -> None:
+    with pytest.raises(RuntimeError, match="--input-kind=pdf can only be used with PDF input"):
+        pipeline.validate_input_kind_for_path("pdf", Path("book.txt"))
+
+
+def test_validate_input_kind_for_path_rejects_txt_modes_for_pdf() -> None:
+    with pytest.raises(RuntimeError, match="--input-kind=clean-txt can only be used with TXT input"):
+        pipeline.validate_input_kind_for_path("clean-txt", Path("book.pdf"))
+    with pytest.raises(RuntimeError, match="--input-kind=raw-txt can only be used with TXT input"):
+        pipeline.validate_input_kind_for_path("raw-txt", Path("book.pdf"))
+
+
+def test_validate_input_kind_for_path_allows_valid_combinations() -> None:
+    pipeline.validate_input_kind_for_path("auto", Path("book.txt"))
+    pipeline.validate_input_kind_for_path("clean-txt", Path("book.txt"))
+    pipeline.validate_input_kind_for_path("raw-txt", Path("book.txt"))
+    pipeline.validate_input_kind_for_path("auto", Path("book.pdf"))
+    pipeline.validate_input_kind_for_path("pdf", Path("book.pdf"))
 
 
 def test_pipeline_test_run_cli_writes_diff_preview(tmp_path: Path) -> None:
@@ -268,6 +291,24 @@ def test_run_job_queue_skips_retry_for_non_retryable_error(tmp_path: Path) -> No
     assert failures[0][0] == "job-c"
 
 
+def test_is_queue_retryable_error_marks_input_kind_mismatch_non_retryable() -> None:
+    assert (
+        pipeline.is_queue_retryable_error("--input-kind=pdf can only be used with PDF input")
+        is False
+    )
+    assert (
+        pipeline.is_queue_retryable_error(
+            "--input-kind=clean-txt can only be used with TXT input"
+        )
+        is False
+    )
+
+
+def test_classify_exception_retryable_prefers_exception_type() -> None:
+    assert pipeline.classify_exception_retryable(pipeline.RetryableTransientError("x")) is True
+    assert pipeline.classify_exception_retryable(pipeline.NonRetryableConfigError("x")) is False
+
+
 def test_build_run_analytics_sums_tts_metrics(tmp_path: Path) -> None:
     manifest_path = tmp_path / "job_manifest.json"
     manifest_path.write_text(
@@ -302,3 +343,206 @@ def test_build_run_analytics_sums_tts_metrics(tmp_path: Path) -> None:
     assert totals["run_estimated_cost_usd"] == 0.03
     assert totals["tts_duration_s"] == 4.5
     assert totals["cache_hits"] == 2
+
+
+def test_discover_resumable_manifests_deduplicates_by_output(tmp_path: Path) -> None:
+    work_tmp_root = tmp_path / "tmp"
+    work_tmp_root.mkdir(parents=True)
+    final_out = tmp_path / "out" / "book.mp3"
+
+    def write_manifest(job_name: str, status: str, mtime: int) -> Path:
+        job_dir = work_tmp_root / job_name
+        job_dir.mkdir(parents=True)
+        manifest_path = job_dir / "job_manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "status": status,
+                    "input": str(tmp_path / "input" / "book.txt"),
+                    "tmp_dir": str(job_dir),
+                    "final_output_mp3": str(final_out),
+                }
+            )
+        )
+        os.utime(manifest_path, (mtime, mtime))
+        return manifest_path
+
+    old_failed = write_manifest("job-old-failed", "failed", 1000)
+    latest_failed = write_manifest("job-latest-failed", "failed", 2000)
+
+    resumable = pipeline.discover_resumable_manifests(work_tmp_root)
+    assert resumable == [latest_failed]
+    assert old_failed not in resumable
+
+
+def test_discover_resumable_manifests_ignores_stale_failed_if_latest_completed(tmp_path: Path) -> None:
+    work_tmp_root = tmp_path / "tmp"
+    work_tmp_root.mkdir(parents=True)
+    final_out = tmp_path / "out" / "book.mp3"
+
+    def write_manifest(job_name: str, status: str, mtime: int) -> Path:
+        job_dir = work_tmp_root / job_name
+        job_dir.mkdir(parents=True)
+        manifest_path = job_dir / "job_manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "status": status,
+                    "input": str(tmp_path / "input" / "book.txt"),
+                    "tmp_dir": str(job_dir),
+                    "final_output_mp3": str(final_out),
+                }
+            )
+        )
+        os.utime(manifest_path, (mtime, mtime))
+        return manifest_path
+
+    write_manifest("job-failed", "failed", 1000)
+    write_manifest("job-completed", "completed", 2000)
+
+    resumable = pipeline.discover_resumable_manifests(work_tmp_root)
+    assert resumable == []
+
+
+def test_run_watch_loop_ignores_disappearing_file(monkeypatch, tmp_path: Path) -> None:
+    missing = tmp_path / "gone.txt"
+    args = pipeline.argparse.Namespace(
+        watch_interval=0.0,
+        watch_stable_seconds=0.0,
+        watch_max_cycles=1,
+        dashboard=False,
+        ui="plain",
+        retry_failed_jobs=False,
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "discover_inputs_allow_empty",
+        lambda _input_dir: [missing],
+    )
+
+    jobs, failures = pipeline.run_watch_loop(
+        args=args,
+        input_dir=tmp_path,
+        work_tmp_root=tmp_path / "work" / "tmp",
+        out_dir=tmp_path / "out",
+    )
+
+    assert jobs == []
+    assert failures == []
+
+
+def test_discover_resumable_manifests_skips_non_retryable_failed_latest(tmp_path: Path) -> None:
+    work_tmp_root = tmp_path / "work" / "tmp"
+    work_tmp_root.mkdir(parents=True)
+    final_out = tmp_path / "out" / "book.mp3"
+
+    def write_manifest(job_name: str, status: str, mtime: int, retryable: bool | None) -> None:
+        job_dir = work_tmp_root / job_name
+        job_dir.mkdir(parents=True)
+        payload = {
+            "status": status,
+            "input": str(tmp_path / "input" / "book.txt"),
+            "tmp_dir": str(job_dir),
+            "final_output_mp3": str(final_out),
+        }
+        if retryable is not None:
+            payload["retryable"] = retryable
+        manifest_path = job_dir / "job_manifest.json"
+        manifest_path.write_text(json.dumps(payload))
+        os.utime(manifest_path, (mtime, mtime))
+
+    write_manifest("job-old-failed", "failed", 1000, True)
+    write_manifest("job-latest-failed", "failed", 2000, False)
+
+    resumable = pipeline.discover_resumable_manifests(work_tmp_root)
+    assert resumable == []
+
+
+def test_run_watch_loop_circuit_breaker_suppresses_repeated_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "input.txt"
+    file_path.write_text("x")
+
+    args = pipeline.argparse.Namespace(
+        watch_interval=0.0,
+        watch_stable_seconds=0.0,
+        watch_max_cycles=2,
+        watch_failure_limit=1,
+        watch_failure_window_seconds=60.0,
+        dashboard=False,
+        ui="plain",
+        retry_failed_jobs=False,
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "discover_inputs_allow_empty",
+        lambda _input_dir: [file_path],
+    )
+
+    calls = {"count": 0}
+
+    def always_fail(**_kwargs: object) -> dict[str, object]:
+        calls["count"] += 1
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(pipeline, "process_single_input_new_job", always_fail)
+
+    jobs, failures = pipeline.run_watch_loop(
+        args=args,
+        input_dir=tmp_path,
+        work_tmp_root=tmp_path / "work" / "tmp",
+        out_dir=tmp_path / "out",
+    )
+
+    assert jobs == []
+    assert len(failures) == 1
+    assert calls["count"] == 1
+
+
+def test_run_watch_loop_circuit_breaker_applies_when_signature_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "input.txt"
+    file_path.write_text("x")
+
+    args = pipeline.argparse.Namespace(
+        watch_interval=0.0,
+        watch_stable_seconds=0.0,
+        watch_max_cycles=2,
+        watch_failure_limit=1,
+        watch_failure_window_seconds=60.0,
+        dashboard=False,
+        ui="plain",
+        retry_failed_jobs=False,
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "discover_inputs_allow_empty",
+        lambda _input_dir: [file_path],
+    )
+
+    calls = {"count": 0}
+
+    def always_fail(**_kwargs: object) -> dict[str, object]:
+        calls["count"] += 1
+        file_path.write_text(f"x{calls['count']}")
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(pipeline, "process_single_input_new_job", always_fail)
+
+    jobs, failures = pipeline.run_watch_loop(
+        args=args,
+        input_dir=tmp_path,
+        work_tmp_root=tmp_path / "work" / "tmp",
+        out_dir=tmp_path / "out",
+    )
+
+    assert jobs == []
+    assert len(failures) == 1
+    assert calls["count"] == 1

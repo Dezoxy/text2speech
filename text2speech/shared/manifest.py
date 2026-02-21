@@ -23,6 +23,7 @@ def set_manifest_status(
     manifest: dict[str, Any],
     status: str,
     error: str | None = None,
+    retryable: bool | None = None,
 ) -> None:
     manifest["status"] = status
     manifest["updated_at"] = now_iso()
@@ -30,6 +31,10 @@ def set_manifest_status(
         manifest.pop("error", None)
     else:
         manifest["error"] = error
+    if retryable is None:
+        manifest.pop("retryable", None)
+    else:
+        manifest["retryable"] = bool(retryable)
     write_manifest(manifest_path, manifest)
 
 

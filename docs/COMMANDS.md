@@ -293,10 +293,19 @@ Expected result:
 t2s --watch
 t2s --watch --watch-interval 5 --watch-stable-seconds 3
 t2s --watch --watch-max-cycles 10 --test-run --test-delay 0 --ui plain
+t2s --watch --watch-failure-limit 3 --watch-failure-window-seconds 120
 ```
 
 Expected result:
 - new or changed files in `input/` are processed automatically.
+- repeated failures on the same file/signature are temporarily suppressed by the watch circuit breaker.
+
+### Strict reliability preset
+
+```bash
+t2s --reliable-mode
+t2s --reliable-mode --watch
+```
 
 ## 11) Environment Doctor And Dependency Precheck
 
