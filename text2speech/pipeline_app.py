@@ -2515,7 +2515,6 @@ def run_watch_loop(
 
     stable_state: dict[str, dict[str, Any]] = {}
     processed_signatures: dict[str, tuple[int, int]] = {}
-    failed_signatures: dict[str, tuple[int, int]] = {}
     failure_history: dict[str, list[float]] = {}
     watch_failure_limit = max(1, int(getattr(args, "watch_failure_limit", 3)))
     watch_failure_window_seconds = float(getattr(args, "watch_failure_window_seconds", 120.0))
@@ -2541,7 +2540,6 @@ def run_watch_loop(
                 if key not in active_keys:
                     stable_state.pop(key, None)
                     processed_signatures.pop(key, None)
-                    failed_signatures.pop(key, None)
             for failure_key in list(failure_history):
                 if failure_key not in active_keys:
                     failure_history.pop(failure_key, None)
@@ -2557,7 +2555,6 @@ def run_watch_loop(
                     # File may disappear between directory listing and stat in watch mode.
                     stable_state.pop(key, None)
                     processed_signatures.pop(key, None)
-                    failed_signatures.pop(key, None)
                     continue
                 signature = (int(stat.st_size), int(stat.st_mtime_ns))
                 entry = stable_state.get(key)
@@ -2573,7 +2570,6 @@ def run_watch_loop(
                     if (
                         args.watch_stable_seconds <= 0
                         and processed_signatures.get(key) != signature
-                        and failed_signatures.get(key) != signature
                         and len(recent_failures) < watch_failure_limit
                     ):
                         ready.append((path, signature))
@@ -2584,9 +2580,6 @@ def run_watch_loop(
                     continue
                 if processed_signatures.get(key) == signature:
                     continue
-                if failed_signatures.get(key) == signature:
-                    continue
-
                 if len(recent_failures) >= watch_failure_limit:
                     continue
 
@@ -2609,16 +2602,15 @@ def run_watch_loop(
                     manifest_path = Path(manifest.get("tmp_dir", "")).resolve() / "job_manifest.json"
                     jobs.append(build_job_record(manifest_path, manifest))
                     processed_signatures[key] = signature
-                    failed_signatures.pop(key, None)
                 except Exception as exc:  # noqa: BLE001
                     failures.append((str(path), str(exc)))
-                    failed_signatures[key] = signature
+                    failure_now = time.time()
                     timestamps = [
                         ts
                         for ts in failure_history.get(key, [])
-                        if now - ts <= watch_failure_window_seconds
+                        if failure_now - ts <= watch_failure_window_seconds
                     ]
-                    timestamps.append(now)
+                    timestamps.append(failure_now)
                     failure_history[key] = timestamps
                     if len(timestamps) >= watch_failure_limit:
                         print(

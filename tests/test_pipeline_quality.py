@@ -546,3 +546,108 @@ def test_run_watch_loop_circuit_breaker_applies_when_signature_changes(
     assert jobs == []
     assert len(failures) == 1
     assert calls["count"] == 1
+
+
+def test_run_watch_loop_uses_failure_timestamp_not_cycle_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "input.txt"
+    file_path.write_text("x")
+
+    args = pipeline.argparse.Namespace(
+        watch_interval=0.0,
+        watch_stable_seconds=0.0,
+        watch_max_cycles=2,
+        watch_failure_limit=1,
+        watch_failure_window_seconds=1.0,
+        dashboard=False,
+        ui="plain",
+        retry_failed_jobs=False,
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "discover_inputs_allow_empty",
+        lambda _input_dir: [file_path],
+    )
+
+    time_points = [0.0, 10.0, 10.5]
+
+    def fake_time() -> float:
+        if len(time_points) > 1:
+            return time_points.pop(0)
+        return time_points[0]
+
+    monkeypatch.setattr(pipeline.time, "time", fake_time)
+
+    calls = {"count": 0}
+
+    def always_fail(**_kwargs: object) -> dict[str, object]:
+        calls["count"] += 1
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(pipeline, "process_single_input_new_job", always_fail)
+
+    jobs, failures = pipeline.run_watch_loop(
+        args=args,
+        input_dir=tmp_path,
+        work_tmp_root=tmp_path / "work" / "tmp",
+        out_dir=tmp_path / "out",
+    )
+
+    assert jobs == []
+    assert len(failures) == 1
+    assert calls["count"] == 1
+
+def test_run_watch_loop_retries_same_signature_after_failure_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "input.txt"
+    file_path.write_text("x")
+
+    args = pipeline.argparse.Namespace(
+        watch_interval=0.0,
+        watch_stable_seconds=0.0,
+        watch_max_cycles=2,
+        watch_failure_limit=1,
+        watch_failure_window_seconds=1.0,
+        dashboard=False,
+        ui="plain",
+        retry_failed_jobs=False,
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "discover_inputs_allow_empty",
+        lambda _input_dir: [file_path],
+    )
+
+    time_points = [0.0, 0.0, 2.0, 2.0]
+
+    def fake_time() -> float:
+        if len(time_points) > 1:
+            return time_points.pop(0)
+        return time_points[0]
+
+    monkeypatch.setattr(pipeline.time, "time", fake_time)
+
+    calls = {"count": 0}
+
+    def always_fail(**_kwargs: object) -> dict[str, object]:
+        calls["count"] += 1
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(pipeline, "process_single_input_new_job", always_fail)
+
+    jobs, failures = pipeline.run_watch_loop(
+        args=args,
+        input_dir=tmp_path,
+        work_tmp_root=tmp_path / "work" / "tmp",
+        out_dir=tmp_path / "out",
+    )
+
+    assert jobs == []
+    assert len(failures) == 2
+    assert calls["count"] == 2
